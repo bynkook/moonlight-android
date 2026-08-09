@@ -792,37 +792,71 @@ public class MediaCodecHelper {
             standard.put(MediaFormat.KEY_LOW_LATENCY, 1);
         }
 
-        if (ultraLowLatency) {
-            LinkedHashMap<String, Integer> vendor = new LinkedHashMap<>();
-            String profileName = null;
-            if (isNvidiaDecoder(decoderInfo.getName())) {
-                profileName = "nvidia-legacy";
-                vendor.put("media.low-latency.enable", 1);
-                vendor.put("vendor.low-latency.enable", 1);
-                vendor.put("disable-output-reorder", 1);
-                vendor.put("vendor.nvidia.disable-output-reorder", 1);
-            }
-            else if (sdkInt >= Build.VERSION_CODES.O &&
-                    isDecoderInList(kirinDecoderPrefixes, decoderInfo.getName())) {
-                profileName = "kirin-legacy";
-                vendor.put("vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-req", 1);
-                vendor.put("vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-rdy", -1);
-            }
-            else if (sdkInt >= Build.VERSION_CODES.O &&
-                    isDecoderInList(exynosDecoderPrefixes, decoderInfo.getName())) {
-                profileName = "exynos-legacy";
-                vendor.put("vendor.rtc-ext-dec-low-latency.enable", 1);
-            }
-
-            if (!vendor.isEmpty()) {
-                profiles.add(new LowLatencyProfilePlanner.Profile(profileName, vendor));
-            }
+        LinkedHashMap<String, Integer> vendor = new LinkedHashMap<>();
+        String familyProfileName = null;
+        if (isNvidiaDecoder(decoderInfo.getName())) {
+            familyProfileName = "nvidia-legacy";
+            vendor.put("media.low-latency.enable", 1);
+            vendor.put("vendor.low-latency.enable", 1);
+            vendor.put("disable-output-reorder", 1);
+            vendor.put("vendor.nvidia.disable-output-reorder", 1);
+        }
+        else if (sdkInt >= Build.VERSION_CODES.O &&
+                isDecoderInList(kirinDecoderPrefixes, decoderInfo.getName())) {
+            familyProfileName = "kirin-legacy";
+            vendor.put("vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-req", 1);
+            vendor.put("vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-rdy", -1);
+        }
+        else if (sdkInt >= Build.VERSION_CODES.O &&
+                isDecoderInList(exynosDecoderPrefixes, decoderInfo.getName())) {
+            familyProfileName = "exynos-legacy";
+            vendor.put("vendor.rtc-ext-dec-low-latency.enable", 1);
         }
 
-        if (!standard.isEmpty()) {
-            profiles.add(new LowLatencyProfilePlanner.Profile("android-standard", standard));
+        LinkedHashMap<String, Integer> scheduler = new LinkedHashMap<>();
+        if (capabilities.maxOperatingRateSupported) {
+            scheduler.put(MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE);
+        }
+        else if (sdkInt >= Build.VERSION_CODES.M) {
+            scheduler.put(MediaFormat.KEY_PRIORITY, 0);
+        }
+
+        if (ultraLowLatency && !vendor.isEmpty()) {
+            if (!standard.isEmpty() && !scheduler.isEmpty()) {
+                addLegacyProfile(profiles, familyProfileName + "-full",
+                        standard, vendor, scheduler);
+            }
+            if (!standard.isEmpty()) {
+                addLegacyProfile(profiles, familyProfileName + "-standard",
+                        standard, vendor);
+            }
+            addLegacyProfile(profiles, "android-standard", standard);
+            if (!scheduler.isEmpty()) {
+                addLegacyProfile(profiles, familyProfileName + "-performance",
+                        vendor, scheduler);
+            }
+            addLegacyProfile(profiles, familyProfileName, vendor);
+            addLegacyProfile(profiles, "performance-only", scheduler);
+        }
+        else {
+            addLegacyProfile(profiles, "android-standard", standard);
+            addLegacyProfile(profiles, "performance-only", scheduler);
         }
         return LowLatencyProfilePlanner.deduplicateProfiles(profiles);
+    }
+
+    @SafeVarargs
+    private static void addLegacyProfile(
+            List<LowLatencyProfilePlanner.Profile> profiles,
+            String name,
+            Map<String, Integer>... optionMaps) {
+        LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
+        for (Map<String, Integer> optionMap : optionMaps) {
+            options.putAll(optionMap);
+        }
+        if (!options.isEmpty()) {
+            profiles.add(new LowLatencyProfilePlanner.Profile(name, options));
+        }
     }
 
     static void applyLowLatencyOptions(MediaFormat videoFormat,

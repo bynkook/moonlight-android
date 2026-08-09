@@ -20,6 +20,7 @@ import org.robolectric.RobolectricTestRunner;
 import org.robolectric.RuntimeEnvironment;
 import org.robolectric.annotation.Config;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
@@ -45,6 +46,17 @@ public class MediaCodecLowLatencyCapabilityTest {
     private static final String MTK_FETCH_TIMEOUT =
             "vendor.mtk.vdec.buffer.fetch.timeout.ms";
     private static final String MTK_FETCH_TIMEOUT_VALUE = MTK_FETCH_TIMEOUT + ".value";
+    private static final String NVIDIA_MEDIA_LOW_LATENCY = "media.low-latency.enable";
+    private static final String NVIDIA_VENDOR_LOW_LATENCY = "vendor.low-latency.enable";
+    private static final String NVIDIA_DISABLE_OUTPUT_REORDER = "disable-output-reorder";
+    private static final String NVIDIA_VENDOR_DISABLE_OUTPUT_REORDER =
+            "vendor.nvidia.disable-output-reorder";
+    private static final String KIRIN_LOW_LATENCY_REQUEST =
+            "vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-req";
+    private static final String KIRIN_LOW_LATENCY_READY =
+            "vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-rdy";
+    private static final String EXYNOS_LOW_LATENCY =
+            "vendor.rtc-ext-dec-low-latency.enable";
 
     private static final List<String> LOW_LATENCY_OPTION_KEYS = Arrays.asList(
             MediaFormat.KEY_LOW_LATENCY,
@@ -520,41 +532,238 @@ public class MediaCodecLowLatencyCapabilityTest {
     }
 
     @Test
-    public void nonEligibleExynosAndNvidiaProductionPathsRemainActive() {
+    public void legacyProfilesPreserveFiniteRiskToSafeCombinations() {
         MediaCodecHelper.VendorParameterCapabilityStore unusedStore =
                 new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
                     throw new AssertionError("Legacy paths must not enumerate vendor parameters");
                 });
-        MediaCodecInfo exynosInfo = mock(MediaCodecInfo.class);
-        when(exynosInfo.getName()).thenReturn("c2.exynos.avc.decoder");
-        MediaFormat exynos = videoFormat();
-        MediaCodecHelper.AppliedLowLatencyOptions exynosApplied =
-                MediaCodecHelper.setDecoderLowLatencyOptions(
-                        exynos, exynosInfo, true, 0,
-                        unusedStore, 33, false, false, "Samsung");
-        assertNotNull(exynosApplied);
-        assertEquals("exynos-legacy", exynosApplied.profileName);
-        assertEquals(1,
-                exynos.getInteger("vendor.rtc-ext-dec-low-latency.enable"));
+        List<LegacyFixture> fixtures = Arrays.asList(
+                new LegacyFixture(
+                        "c2.nvidia.avc.decoder",
+                        "NVIDIA",
+                        true,
+                        true,
+                        Arrays.asList(
+                                "nvidia-legacy-full",
+                                "nvidia-legacy-standard",
+                                "android-standard",
+                                "nvidia-legacy-performance",
+                                "nvidia-legacy",
+                                "performance-only"),
+                        Arrays.asList(
+                                options(
+                                        MediaFormat.KEY_LOW_LATENCY, 1,
+                                        NVIDIA_MEDIA_LOW_LATENCY, 1,
+                                        NVIDIA_VENDOR_LOW_LATENCY, 1,
+                                        NVIDIA_DISABLE_OUTPUT_REORDER, 1,
+                                        NVIDIA_VENDOR_DISABLE_OUTPUT_REORDER, 1,
+                                        MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE),
+                                options(
+                                        MediaFormat.KEY_LOW_LATENCY, 1,
+                                        NVIDIA_MEDIA_LOW_LATENCY, 1,
+                                        NVIDIA_VENDOR_LOW_LATENCY, 1,
+                                        NVIDIA_DISABLE_OUTPUT_REORDER, 1,
+                                        NVIDIA_VENDOR_DISABLE_OUTPUT_REORDER, 1),
+                                options(MediaFormat.KEY_LOW_LATENCY, 1),
+                                options(
+                                        NVIDIA_MEDIA_LOW_LATENCY, 1,
+                                        NVIDIA_VENDOR_LOW_LATENCY, 1,
+                                        NVIDIA_DISABLE_OUTPUT_REORDER, 1,
+                                        NVIDIA_VENDOR_DISABLE_OUTPUT_REORDER, 1,
+                                        MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE),
+                                options(
+                                        NVIDIA_MEDIA_LOW_LATENCY, 1,
+                                        NVIDIA_VENDOR_LOW_LATENCY, 1,
+                                        NVIDIA_DISABLE_OUTPUT_REORDER, 1,
+                                        NVIDIA_VENDOR_DISABLE_OUTPUT_REORDER, 1),
+                                options(MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE))),
+                new LegacyFixture(
+                        "OMX.hisi.video.decoder.avc",
+                        "Huawei",
+                        false,
+                        false,
+                        Arrays.asList(
+                                "kirin-legacy-performance",
+                                "kirin-legacy",
+                                "performance-only"),
+                        Arrays.asList(
+                                options(
+                                        KIRIN_LOW_LATENCY_REQUEST, 1,
+                                        KIRIN_LOW_LATENCY_READY, -1,
+                                        MediaFormat.KEY_PRIORITY, 0),
+                                options(
+                                        KIRIN_LOW_LATENCY_REQUEST, 1,
+                                        KIRIN_LOW_LATENCY_READY, -1),
+                                options(MediaFormat.KEY_PRIORITY, 0))),
+                new LegacyFixture(
+                        "c2.exynos.avc.decoder",
+                        "Samsung",
+                        true,
+                        false,
+                        Arrays.asList(
+                                "exynos-legacy-full",
+                                "exynos-legacy-standard",
+                                "android-standard",
+                                "exynos-legacy-performance",
+                                "exynos-legacy",
+                                "performance-only"),
+                        Arrays.asList(
+                                options(
+                                        MediaFormat.KEY_LOW_LATENCY, 1,
+                                        EXYNOS_LOW_LATENCY, 1,
+                                        MediaFormat.KEY_PRIORITY, 0),
+                                options(
+                                        MediaFormat.KEY_LOW_LATENCY, 1,
+                                        EXYNOS_LOW_LATENCY, 1),
+                                options(MediaFormat.KEY_LOW_LATENCY, 1),
+                                options(
+                                        EXYNOS_LOW_LATENCY, 1,
+                                        MediaFormat.KEY_PRIORITY, 0),
+                                options(EXYNOS_LOW_LATENCY, 1),
+                                options(MediaFormat.KEY_PRIORITY, 0))));
+
+        for (LegacyFixture fixture : fixtures) {
+            MediaCodecInfo decoderInfo = mock(MediaCodecInfo.class);
+            when(decoderInfo.getName()).thenReturn(fixture.decoderName);
+            List<MediaCodecHelper.AppliedLowLatencyOptions> profiles = new ArrayList<>();
+            for (int profileIndex = 0; profileIndex < fixture.expectedNames.size(); profileIndex++) {
+                MediaFormat format = videoFormat();
+                MediaCodecHelper.AppliedLowLatencyOptions applied =
+                        MediaCodecHelper.setDecoderLowLatencyOptions(
+                                format,
+                                decoderInfo,
+                                true,
+                                profileIndex,
+                                unusedStore,
+                                33,
+                                fixture.androidStandardSupported,
+                                fixture.maxOperatingRateSupported,
+                                fixture.manufacturer);
+                assertNotNull(fixture.decoderName, applied);
+                profiles.add(applied);
+                assertEquals(fixture.expectedOptions.get(profileIndex), applied.integerOptions);
+                assertEquals(fixture.expectedOptions.get(profileIndex).keySet(), optionKeys(format));
+            }
+
+            assertEquals(fixture.expectedNames, appliedNames(profiles));
+            assertNull(MediaCodecHelper.setDecoderLowLatencyOptions(
+                    videoFormat(),
+                    decoderInfo,
+                    true,
+                    fixture.expectedNames.size(),
+                    unusedStore,
+                    33,
+                    fixture.androidStandardSupported,
+                    fixture.maxOperatingRateSupported,
+                    fixture.manufacturer));
+        }
+    }
+
+    @Test
+    public void legacyUllOffOmitsVendorAndKeepsStandardOrSchedulerFallbacks() {
+        MediaCodecHelper.VendorParameterCapabilityStore unusedStore =
+                new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
+                    throw new AssertionError("Legacy paths must not enumerate vendor parameters");
+                });
 
         MediaCodecInfo nvidiaInfo = mock(MediaCodecInfo.class);
         when(nvidiaInfo.getName()).thenReturn("c2.nvidia.avc.decoder");
-        MediaFormat nvidia = videoFormat();
-        MediaCodecHelper.AppliedLowLatencyOptions nvidiaApplied =
-                MediaCodecHelper.setDecoderLowLatencyOptions(
-                        nvidia, nvidiaInfo, true, 0,
-                        unusedStore, 33, false, false, "NVIDIA");
-        assertNotNull(nvidiaApplied);
-        assertEquals("nvidia-legacy", nvidiaApplied.profileName);
-        assertEquals(1, nvidia.getInteger("media.low-latency.enable"));
-        assertEquals(1, nvidia.getInteger("vendor.low-latency.enable"));
-        assertEquals(1, nvidia.getInteger("disable-output-reorder"));
-        assertEquals(1, nvidia.getInteger("vendor.nvidia.disable-output-reorder"));
+        assertLegacyProfiles(
+                nvidiaInfo,
+                false,
+                unusedStore,
+                true,
+                false,
+                "NVIDIA",
+                Arrays.asList("android-standard", "performance-only"),
+                Arrays.asList(
+                        options(MediaFormat.KEY_LOW_LATENCY, 1),
+                        options(MediaFormat.KEY_PRIORITY, 0)));
 
+        MediaCodecInfo genericInfo = mock(MediaCodecInfo.class);
+        when(genericInfo.getName()).thenReturn("c2.vendor.avc.decoder");
+        assertLegacyProfiles(
+                genericInfo,
+                false,
+                unusedStore,
+                false,
+                false,
+                "Generic",
+                Collections.singletonList("performance-only"),
+                Collections.singletonList(options(MediaFormat.KEY_PRIORITY, 0)));
+    }
+
+    private static void assertLegacyProfiles(
+            MediaCodecInfo decoderInfo,
+            boolean ultraLowLatency,
+            MediaCodecHelper.VendorParameterCapabilityStore capabilityStore,
+            boolean androidLowLatencySupported,
+            boolean maxOperatingRateSupported,
+            String manufacturer,
+            List<String> expectedNames,
+            List<Map<String, Integer>> expectedOptions) {
+        List<MediaCodecHelper.AppliedLowLatencyOptions> profiles = new ArrayList<>();
+        for (int profileIndex = 0; profileIndex < expectedNames.size(); profileIndex++) {
+            MediaFormat format = videoFormat();
+            MediaCodecHelper.AppliedLowLatencyOptions applied =
+                    MediaCodecHelper.setDecoderLowLatencyOptions(
+                            format,
+                            decoderInfo,
+                            ultraLowLatency,
+                            profileIndex,
+                            capabilityStore,
+                            33,
+                            androidLowLatencySupported,
+                            maxOperatingRateSupported,
+                            manufacturer);
+            assertNotNull(applied);
+            assertEquals(expectedOptions.get(profileIndex), applied.integerOptions);
+            assertEquals(expectedOptions.get(profileIndex).keySet(), optionKeys(format));
+            profiles.add(applied);
+        }
+        assertEquals(expectedNames, appliedNames(profiles));
         assertNull(MediaCodecHelper.setDecoderLowLatencyOptions(
-                MediaFormat.createVideoFormat("video/avc", 1920, 1080),
-                nvidiaInfo, true, 1,
-                unusedStore, 33, false, false, "NVIDIA"));
+                videoFormat(),
+                decoderInfo,
+                ultraLowLatency,
+                expectedNames.size(),
+                capabilityStore,
+                33,
+                androidLowLatencySupported,
+                maxOperatingRateSupported,
+                manufacturer));
+    }
+
+    private static List<String> appliedNames(
+            List<MediaCodecHelper.AppliedLowLatencyOptions> profiles) {
+        List<String> names = new ArrayList<>();
+        for (MediaCodecHelper.AppliedLowLatencyOptions profile : profiles) {
+            names.add(profile.profileName);
+        }
+        return names;
+    }
+
+    private static final class LegacyFixture {
+        final String decoderName;
+        final String manufacturer;
+        final boolean androidStandardSupported;
+        final boolean maxOperatingRateSupported;
+        final List<String> expectedNames;
+        final List<Map<String, Integer>> expectedOptions;
+
+        LegacyFixture(String decoderName,
+                      String manufacturer,
+                      boolean androidStandardSupported,
+                      boolean maxOperatingRateSupported,
+                      List<String> expectedNames,
+                      List<Map<String, Integer>> expectedOptions) {
+            this.decoderName = decoderName;
+            this.manufacturer = manufacturer;
+            this.androidStandardSupported = androidStandardSupported;
+            this.maxOperatingRateSupported = maxOperatingRateSupported;
+            this.expectedNames = expectedNames;
+            this.expectedOptions = expectedOptions;
+        }
     }
 
     private static MediaCodecHelper.VendorParameterCapabilityStore s25Store(

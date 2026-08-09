@@ -242,6 +242,24 @@ public class MediaCodecDecoderRecoveryProfileTest {
     }
 
     @Test
+    public void initializeDecoderBooleanSelectsTheEntryPointBaseFailurePolicy() {
+        MediaCodecDecoderRenderer.DecoderConfigurationProfile base =
+                MediaCodecDecoderRenderer.DecoderConfigurationProfile.base();
+
+        MediaCodecDecoderRenderer.ConfigurationMode setupMode =
+                MediaCodecDecoderRenderer.configurationModeForInitializeDecoder(false);
+        MediaCodecDecoderRenderer.ConfigurationMode recreationMode =
+                MediaCodecDecoderRenderer.configurationModeForInitializeDecoder(true);
+
+        assertEquals(MediaCodecDecoderRenderer.ConfigurationMode.INITIAL, setupMode);
+        assertEquals(MediaCodecDecoderRenderer.ConfigurationFailureDisposition.RETURN_MINUS_FIVE,
+                MediaCodecDecoderRenderer.configurationFailureDisposition(setupMode, base));
+        assertEquals(MediaCodecDecoderRenderer.ConfigurationMode.RUNTIME_RECOVERY, recreationMode);
+        assertEquals(MediaCodecDecoderRenderer.ConfigurationFailureDisposition.RETHROW,
+                MediaCodecDecoderRenderer.configurationFailureDisposition(recreationMode, base));
+    }
+
+    @Test
     public void finalFailureLogIdentifiesDecoderProfileCapabilityAndRequestedOptions() {
         String message = MediaCodecDecoderRenderer.finalConfigurationFailureMessage(
                 "c2.qti.avc.decoder",

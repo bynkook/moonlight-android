@@ -194,6 +194,13 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 ConfigurationFailureDisposition.RETURN_MINUS_FIVE;
     }
 
+    static ConfigurationMode configurationModeForInitializeDecoder(
+            boolean throwOnCodecError) {
+        return throwOnCodecError ?
+                ConfigurationMode.RUNTIME_RECOVERY :
+                ConfigurationMode.INITIAL;
+    }
+
     static String finalConfigurationFailureMessage(
             String decoderName,
             DecoderConfigurationProfile profile,
@@ -856,13 +863,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     }
 
     public int initializeDecoder(boolean throwOnCodecError) {
-        // Runtime recovery uses initializeDecoderForRuntimeRecovery() so the initial path always
-        // preserves the historical -5 return contract for a failed renderer-owned base format.
-        return initializeDecoder(ConfigurationMode.INITIAL);
-    }
-
-    private int initializeDecoderForRuntimeRecovery() {
-        return initializeDecoder(ConfigurationMode.RUNTIME_RECOVERY);
+        return initializeDecoder(
+                configurationModeForInitializeDecoder(throwOnCodecError));
     }
 
     private int initializeDecoder(ConfigurationMode configurationMode) {
@@ -1129,7 +1131,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     videoDecoder.release();
 
                     try {
-                        int err = initializeDecoderForRuntimeRecovery();
+                        int err = initializeDecoder(true);
                         if (err != 0) {
                             throw new IllegalStateException("Decoder reset failed: " + err);
                         }
