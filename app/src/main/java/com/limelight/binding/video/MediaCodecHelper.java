@@ -167,6 +167,7 @@ public class MediaCodecHelper {
                 final MediaCodec codec = MediaCodec.createByCodecName(decoderName);
                 return new VendorParameterSession() {
                     @Override
+                    @androidx.annotation.RequiresApi(api = Build.VERSION_CODES.S)
                     public List<String> getSupportedVendorParameters() {
                         return codec.getSupportedVendorParameters();
                     }
