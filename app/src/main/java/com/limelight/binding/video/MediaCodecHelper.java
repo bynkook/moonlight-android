@@ -627,7 +627,15 @@ public class MediaCodecHelper {
         // Options here should be tried in the order of most to least risky. The decoder will use
         // the first MediaFormat that doesn't fail in configure().
 
-        if (isDecoderInList(qualcommDecoderPrefixes, decoderInfo.getName())) {
+        String decoderName = decoderInfo.getName();
+        LowLatencyProfilePlanner.DecoderFamily decoderFamily =
+                LowLatencyProfilePlanner.classifyDecoderFamily(decoderName);
+        boolean legacyVdecLowLatencyAllowed =
+                LowLatencyProfilePlanner.isLegacyVdecLowLatencyAllowed(
+                        decoderName, Build.MANUFACTURER, Build.VERSION.SDK_INT);
+        if (decoderFamily == LowLatencyProfilePlanner.DecoderFamily.QUALCOMM ||
+                decoderFamily == LowLatencyProfilePlanner.DecoderFamily.MEDIATEK ||
+                legacyVdecLowLatencyAllowed) {
             return setDecoderLowLatencyOptions(
                     videoFormat,
                     decoderInfo,
@@ -637,7 +645,8 @@ public class MediaCodecHelper {
                     Build.VERSION.SDK_INT,
                     decoderSupportsAndroidRLowLatency(
                             decoderInfo, videoFormat.getString(MediaFormat.KEY_MIME)),
-                    decoderSupportsMaxOperatingRate(decoderInfo.getName()));
+                    decoderSupportsMaxOperatingRate(decoderName),
+                    Build.MANUFACTURER);
         }
 
         boolean setNewOption = false;
@@ -665,25 +674,6 @@ public class MediaCodecHelper {
             // ALONSOJR1980: "low-latency" is not enough, continuing to add specific extensions
         }
 
-        if (tryNumber < 2 &&
-                (!Build.MANUFACTURER.equalsIgnoreCase("xiaomi") || Build.VERSION.SDK_INT > Build.VERSION_CODES.M)) {
-            // MediaTek decoders don't use vendor-defined keys for low latency mode. Instead, they have a modified
-            // version of AOSP's ACodec.cpp which supports the "vdec-lowlatency" option. This option is passed down
-            // to the decoder as OMX.MTK.index.param.video.LowLatencyDecode.
-            //
-            // This option is also plumbed for Amazon Amlogic-based devices like the Fire TV 3. Not only does it
-            // reduce latency on Amlogic, it fixes the HEVC bug that causes the decoder to not output any frames.
-            // Unfortunately, it does the exact opposite for the Xiaomi MITV4-ANSM0, breaking it in the way that
-            // Fire TV was broken prior to vdec-lowlatency :(
-            //
-            // On Fire TV 3, vdec-lowlatency is translated to OMX.amazon.fireos.index.video.lowLatencyDecode.
-            //
-            // https://github.com/yuan1617/Framwork/blob/master/frameworks/av/media/libstagefright/ACodec.cpp
-            // https://github.com/iykex/vendor_mediatek_proprietary_hardware/blob/master/libomx/video/MtkOmxVdecEx/MtkOmxVdecEx.h
-            videoFormat.setInteger("vdec-lowlatency", 1);
-            setNewOption = true;
-        }
-
         if (tryNumber < 3) {
             if (MediaCodecHelper.decoderSupportsMaxOperatingRate(decoderInfo.getName())) {
                 videoFormat.setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE);
@@ -706,53 +696,7 @@ public class MediaCodecHelper {
             //
             // NOTE: Update knownVendorLowLatencyOptions if you modify this code!
             // ALONSOJR1980
-//            else if (isDecoderInList(mtkDecoderPrefixes, decoderInfo.getName())) {
-//                if (tryNumber < 4) {
-//
-//                    videoFormat.setInteger("vendor.mtk.vdec.cpu.boost.mode.value", 2);
-//                    videoFormat.setInteger("vendor.mtk.ext.dolby.vision.cpu-boost", 1);
-//                    videoFormat.setInteger("vendor.mtk.vdec.bq.guard.interval.time.value", 2);
-//                    videoFormat.setInteger("vendor.mtk.vdec.buffer.fetch.timeout.ms.value", 2);
-            if (isDecoderInList(mtkDecoderPrefixes, decoderInfo.getName())) {
-                if (tryNumber < 4) {
-                    // --- PRESET: MTK Low-Latency (safe & balanced, no duplicates) ---
-
-                    // Boost/DVFS: moderate profile
-                    safeSet(videoFormat, "vdec-lowlatency", 1);
-                    safeSet(videoFormat, "vendor.mtk.vdec.cpu.boost.mode", 1);
-                    safeSet(videoFormat, "vendor.mtk.vdec.cpu.boost.mode.value", 1);
-                    safeSet(videoFormat, "vendor.mtk.vdec.dvfs.mode", 1);
-                    safeSet(videoFormat, "vendor.mtk.vdec.dvfs.level", 1);
-
-                    // Pipeline / code path
-                    safeSet(videoFormat, "vendor.mtk.vdec.low-latency.mode", 1);    // Enable low-latency path
-                    safeSet(videoFormat, "vendor.mtk.vdec.ultra-low-latency", 0);   // ULL off for stability
-                    safeSet(videoFormat, "vendor.mtk.vdec.disable-idle", 1);        // Prevent clock downscaling
-                    safeSet(videoFormat, "vendor.mtk.vdec.preload.frame.count", 1); // Light prebuffering
-
-                    // Queue / timeouts (moderate)
-                    safeSet(videoFormat, "vendor.mtk.vdec.buffer.fetch.timeout.ms", 4);
-                    safeSet(videoFormat, "vendor.mtk.vdec.bq.guard.interval.time", 4);
-                    safeSet(videoFormat, "vendor.mtk.vdec.input.max.queue.depth", 3);
-                    safeSet(videoFormat, "vendor.mtk.vdec.output.max.queue.depth", 3);
-
-                    // Pacing: controlled by the app
-                    safeSet(videoFormat, "vendor.mtk.vdec.vsync.adjust.enable", 0);
-
-                    // Skip/drop: only NVOP
-                    safeSet(videoFormat, "vendor.mtk.vdec.nvop.skip", 1);
-                    safeSet(videoFormat, "vendor.mtk.vdec.skip.mode", 0);
-                    safeSet(videoFormat, "vendor.mtk.vdec.drop.nonref.frame", 0);
-                    safeSet(videoFormat, "vendor.mtk.vdec.frame-drop.policy", 0);
-
-                    // Standard Android hints
-                    safeSet(videoFormat, MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE);
-                    safeSet(videoFormat, MediaFormat.KEY_PRIORITY, 0);
-                }
-                setNewOption = true;
-            }
-
-            else if (isDecoderInList(kirinDecoderPrefixes, decoderInfo.getName())) {
+            if (isDecoderInList(kirinDecoderPrefixes, decoderInfo.getName())) {
                 if (tryNumber < 4) {
                     // Kirin low latency options
                     // https://developer.huawei.com/consumer/cn/forum/topic/0202325564295980115
@@ -790,20 +734,55 @@ public class MediaCodecHelper {
             int sdkInt,
             boolean androidLowLatencySupported,
             boolean maxOperatingRateSupported) {
-        if (!isDecoderInList(qualcommDecoderPrefixes, decoderInfo.getName()) || tryNumber < 0) {
+        return setDecoderLowLatencyOptions(
+                videoFormat,
+                decoderInfo,
+                ultraLowLatency,
+                tryNumber,
+                capabilityStore,
+                sdkInt,
+                androidLowLatencySupported,
+                maxOperatingRateSupported,
+                Build.MANUFACTURER);
+    }
+
+    static boolean setDecoderLowLatencyOptions(
+            MediaFormat videoFormat,
+            MediaCodecInfo decoderInfo,
+            boolean ultraLowLatency,
+            int tryNumber,
+            VendorParameterCapabilityStore capabilityStore,
+            int sdkInt,
+            boolean androidLowLatencySupported,
+            boolean maxOperatingRateSupported,
+            String manufacturer) {
+        if (tryNumber < 0) {
             return false;
         }
 
-        VendorParameterSnapshot snapshot = capabilityStore.getSnapshot(
-                decoderInfo.getName(), sdkInt);
+        String decoderName = decoderInfo.getName();
+        LowLatencyProfilePlanner.DecoderFamily decoderFamily =
+                LowLatencyProfilePlanner.classifyDecoderFamily(decoderName);
+        boolean legacyVdecLowLatencyAllowed =
+                LowLatencyProfilePlanner.isLegacyVdecLowLatencyAllowed(
+                        decoderName, manufacturer, sdkInt);
+        if (decoderFamily == LowLatencyProfilePlanner.DecoderFamily.OTHER &&
+                !legacyVdecLowLatencyAllowed) {
+            return false;
+        }
+
+        VendorParameterSnapshot snapshot =
+                decoderFamily == LowLatencyProfilePlanner.DecoderFamily.OTHER ?
+                        VendorParameterSnapshot.unavailable() :
+                        capabilityStore.getSnapshot(decoderName, sdkInt);
         LowLatencyProfilePlanner.Capabilities capabilities =
                 new LowLatencyProfilePlanner.Capabilities(
-                        LowLatencyProfilePlanner.DecoderFamily.QUALCOMM,
-                        decoderInfo.getName(),
+                        decoderFamily,
+                        decoderName,
                         sdkInt,
                         androidLowLatencySupported,
                         maxOperatingRateSupported,
-                        false,
+                        legacyVdecLowLatencyAllowed,
                         snapshot.enumerationAvailable,
                         snapshot.supportedParameters);
         List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(

@@ -36,6 +36,14 @@ import java.util.concurrent.atomic.AtomicInteger;
 @RunWith(RobolectricTestRunner.class)
 @Config(sdk = {33})
 public class MediaCodecLowLatencyCapabilityTest {
+    private static final String MTK_LOW_LATENCY_MODE =
+            "vendor.mtk.vdec.low-latency.mode";
+    private static final String MTK_ULTRA_LOW_LATENCY =
+            "vendor.mtk.vdec.ultra-low-latency";
+    private static final String MTK_FETCH_TIMEOUT =
+            "vendor.mtk.vdec.buffer.fetch.timeout.ms";
+    private static final String MTK_FETCH_TIMEOUT_VALUE = MTK_FETCH_TIMEOUT + ".value";
+
     private static final List<String> LOW_LATENCY_OPTION_KEYS = Arrays.asList(
             MediaFormat.KEY_LOW_LATENCY,
             LowLatencyProfilePlanner.VDEC_LOW_LATENCY,
@@ -44,6 +52,10 @@ public class MediaCodecLowLatencyCapabilityTest {
             LowLatencyProfilePlanner.QTI_SOFTWARE_FENCE,
             LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE,
             LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_TYPE,
+            MTK_LOW_LATENCY_MODE,
+            MTK_ULTRA_LOW_LATENCY,
+            MTK_FETCH_TIMEOUT,
+            MTK_FETCH_TIMEOUT_VALUE,
             MediaFormat.KEY_OPERATING_RATE,
             MediaFormat.KEY_PRIORITY);
 
@@ -352,6 +364,127 @@ public class MediaCodecLowLatencyCapabilityTest {
                 true));
         assertEquals(before, format.toString());
         assertEquals(0, openCount.get());
+    }
+
+    @Test
+    public void mediatekHelperAppliesFreshFiniteProfilesAndTerminates() {
+        AtomicInteger openCount = new AtomicInteger();
+        AtomicInteger releaseCount = new AtomicInteger();
+        MediaCodecHelper.VendorParameterCapabilityStore store =
+                new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
+                    openCount.incrementAndGet();
+                    return session(Arrays.asList(
+                            MTK_LOW_LATENCY_MODE,
+                            MTK_ULTRA_LOW_LATENCY,
+                            MTK_FETCH_TIMEOUT,
+                            MTK_FETCH_TIMEOUT_VALUE), releaseCount);
+                });
+        MediaCodecInfo decoderInfo = mock(MediaCodecInfo.class);
+        when(decoderInfo.getName()).thenReturn("C2.MTK.AVC.Decoder");
+        List<Map<String, Integer>> expectedProfiles = Arrays.asList(
+                options(
+                        MediaFormat.KEY_LOW_LATENCY, 1,
+                        LowLatencyProfilePlanner.VDEC_LOW_LATENCY, 1,
+                        MTK_LOW_LATENCY_MODE, 1,
+                        MTK_ULTRA_LOW_LATENCY, 1,
+                        MTK_FETCH_TIMEOUT_VALUE, 2,
+                        MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE),
+                options(
+                        MediaFormat.KEY_LOW_LATENCY, 1,
+                        LowLatencyProfilePlanner.VDEC_LOW_LATENCY, 1,
+                        MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE),
+                options(
+                        MediaFormat.KEY_LOW_LATENCY, 1,
+                        MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE),
+                options(MediaFormat.KEY_LOW_LATENCY, 1),
+                options(
+                        LowLatencyProfilePlanner.VDEC_LOW_LATENCY, 1,
+                        MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE),
+                options(LowLatencyProfilePlanner.VDEC_LOW_LATENCY, 1),
+                options(MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE));
+
+        for (int tryNumber = 0; tryNumber < expectedProfiles.size(); tryNumber++) {
+            MediaFormat format = videoFormat();
+            assertTrue(MediaCodecHelper.setDecoderLowLatencyOptions(
+                    format,
+                    decoderInfo,
+                    true,
+                    tryNumber,
+                    store,
+                    33,
+                    true,
+                    true,
+                    "Samsung"));
+            assertEquals(expectedProfiles.get(tryNumber).keySet(), optionKeys(format));
+            assertEquals(expectedProfiles.get(tryNumber), lowLatencyOptions(format));
+        }
+
+        MediaFormat exhausted = videoFormat();
+        String exhaustedBefore = exhausted.toString();
+        assertFalse(MediaCodecHelper.setDecoderLowLatencyOptions(
+                exhausted,
+                decoderInfo,
+                true,
+                expectedProfiles.size(),
+                store,
+                33,
+                true,
+                true,
+                "Samsung"));
+        assertEquals(exhaustedBefore, exhausted.toString());
+        assertTrue(lowLatencyOptions(exhausted).isEmpty());
+        assertEquals(1, openCount.get());
+        assertEquals(1, releaseCount.get());
+    }
+
+    @Test
+    public void genericAmlogicLegacyHelperDoesNotProbeVendorParameters() {
+        AtomicInteger openCount = new AtomicInteger();
+        MediaCodecHelper.VendorParameterCapabilityStore store =
+                new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
+                    openCount.incrementAndGet();
+                    throw new AssertionError("Generic legacy path must not enumerate vendor parameters");
+                });
+        MediaCodecInfo decoderInfo = mock(MediaCodecInfo.class);
+        when(decoderInfo.getName()).thenReturn("OMX.AMLOGIC.video.decoder.avc");
+
+        MediaFormat standard = videoFormat();
+        assertTrue(MediaCodecHelper.setDecoderLowLatencyOptions(
+                standard, decoderInfo, true, 0, store, 33, true, true, "Google"));
+        assertEquals(options(MediaFormat.KEY_LOW_LATENCY, 1), lowLatencyOptions(standard));
+
+        MediaFormat legacy = videoFormat();
+        assertTrue(MediaCodecHelper.setDecoderLowLatencyOptions(
+                legacy, decoderInfo, true, 1, store, 33, true, true, "Google"));
+        assertEquals(options(LowLatencyProfilePlanner.VDEC_LOW_LATENCY, 1),
+                lowLatencyOptions(legacy));
+
+        MediaFormat exhausted = videoFormat();
+        assertFalse(MediaCodecHelper.setDecoderLowLatencyOptions(
+                exhausted, decoderInfo, true, 2, store, 33, true, true, "Google"));
+        assertTrue(lowLatencyOptions(exhausted).isEmpty());
+        assertEquals(0, openCount.get());
+    }
+
+    @Test
+    public void nonEligibleExynosAndNvidiaProductionPathsRemainActive() {
+        MediaCodecInfo exynosInfo = mock(MediaCodecInfo.class);
+        when(exynosInfo.getName()).thenReturn("c2.exynos.avc.decoder");
+        MediaFormat exynos = videoFormat();
+        assertTrue(MediaCodecHelper.setDecoderLowLatencyOptions(
+                exynos, exynosInfo, true, 3));
+        assertEquals(1,
+                exynos.getInteger("vendor.rtc-ext-dec-low-latency.enable"));
+
+        MediaCodecInfo nvidiaInfo = mock(MediaCodecInfo.class);
+        when(nvidiaInfo.getName()).thenReturn("c2.nvidia.avc.decoder");
+        MediaFormat nvidia = videoFormat();
+        assertTrue(MediaCodecHelper.setDecoderLowLatencyOptions(
+                nvidia, nvidiaInfo, true, 4));
+        assertEquals(1, nvidia.getInteger("media.low-latency.enable"));
+        assertEquals(1, nvidia.getInteger("vendor.low-latency.enable"));
+        assertEquals(1, nvidia.getInteger("disable-output-reorder"));
+        assertEquals(1, nvidia.getInteger("vendor.nvidia.disable-output-reorder"));
     }
 
     private static MediaCodecHelper.VendorParameterCapabilityStore s25Store(

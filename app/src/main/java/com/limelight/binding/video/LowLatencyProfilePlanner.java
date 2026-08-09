@@ -24,6 +24,22 @@ final class LowLatencyProfilePlanner {
     static final String QTI_OUTPUT_FENCE_ENABLE = "vendor.qti-ext-output-fence.enable";
     static final String QTI_OUTPUT_FENCE_TYPE = "vendor.qti-ext-output-fence.fence_type";
 
+    static final String MTK_LOW_LATENCY_MODE = "vendor.mtk.vdec.low-latency.mode";
+    static final String MTK_DISABLE_IDLE = "vendor.mtk.vdec.disable-idle";
+    static final String MTK_VSYNC_ADJUST_ENABLE = "vendor.mtk.vdec.vsync.adjust.enable";
+    static final String MTK_ULTRA_LOW_LATENCY = "vendor.mtk.vdec.ultra-low-latency";
+    static final String MTK_PRELOAD_FRAME_COUNT = "vendor.mtk.vdec.preload.frame.count";
+    static final String MTK_INPUT_QUEUE_DEPTH = "vendor.mtk.vdec.input.max.queue.depth";
+    static final String MTK_OUTPUT_QUEUE_DEPTH = "vendor.mtk.vdec.output.max.queue.depth";
+    static final String MTK_FETCH_TIMEOUT = "vendor.mtk.vdec.buffer.fetch.timeout.ms";
+    static final String MTK_FETCH_TIMEOUT_VALUE = MTK_FETCH_TIMEOUT + ".value";
+    static final String MTK_GUARD_INTERVAL = "vendor.mtk.vdec.bq.guard.interval.time";
+    static final String MTK_GUARD_INTERVAL_VALUE = MTK_GUARD_INTERVAL + ".value";
+    static final String MTK_CPU_BOOST = "vendor.mtk.vdec.cpu.boost.mode";
+    static final String MTK_CPU_BOOST_VALUE = MTK_CPU_BOOST + ".value";
+    static final String MTK_DVFS_MODE = "vendor.mtk.vdec.dvfs.mode";
+    static final String MTK_DVFS_LEVEL = "vendor.mtk.vdec.dvfs.level";
+
     enum DecoderFamily {
         QUALCOMM,
         MEDIATEK,
@@ -126,9 +142,45 @@ final class LowLatencyProfilePlanner {
             return planQualcomm(capabilities, ultraLowLatency);
         }
 
+        if (capabilities.family == DecoderFamily.MEDIATEK) {
+            return planMediaTek(capabilities, ultraLowLatency);
+        }
+
+        if (capabilities.legacyVdecLowLatencyAllowed) {
+            return planGenericLegacy(capabilities);
+        }
+
         List<Profile> profiles = new ArrayList<>();
         addProfile(profiles, "android-standard", standardOptions(capabilities));
         return deduplicateProfiles(profiles);
+    }
+
+    static DecoderFamily classifyDecoderFamily(String decoderName) {
+        String normalizedName = Objects.requireNonNull(decoderName).toLowerCase(Locale.US);
+        if (startsWithAny(normalizedName, "omx.qcom", "omx.qti", "c2.qti", "c2.qcom")) {
+            return DecoderFamily.QUALCOMM;
+        }
+        if (startsWithAny(normalizedName, "omx.mtk", "c2.mtk")) {
+            return DecoderFamily.MEDIATEK;
+        }
+        return DecoderFamily.OTHER;
+    }
+
+    static boolean isLegacyVdecLowLatencyAllowed(String decoderName,
+                                                  String manufacturer,
+                                                  int sdkInt) {
+        DecoderFamily family = classifyDecoderFamily(decoderName);
+        if (family == DecoderFamily.QUALCOMM) {
+            return false;
+        }
+        if ("xiaomi".equalsIgnoreCase(manufacturer) && sdkInt <= 23) {
+            return false;
+        }
+
+        String normalizedName = decoderName.toLowerCase(Locale.US);
+        return family == DecoderFamily.MEDIATEK ||
+                startsWithAny(normalizedName, "omx.amlogic", "c2.amlogic") ||
+                "amazon".equalsIgnoreCase(manufacturer);
     }
 
     static List<Profile> deduplicateProfiles(List<Profile> profiles) {
@@ -183,6 +235,52 @@ final class LowLatencyProfilePlanner {
         return deduplicateProfiles(profiles);
     }
 
+    private static List<Profile> planMediaTek(Capabilities capabilities,
+                                               boolean ultraLowLatency) {
+        LinkedHashMap<String, Integer> standard = standardOptions(capabilities);
+        LinkedHashMap<String, Integer> legacy = legacyOptions(capabilities);
+        List<Profile> profiles = new ArrayList<>();
+
+        if (!ultraLowLatency) {
+            addProfile(profiles, "android-standard", standard);
+            addProfile(profiles, "mtk-legacy", legacy);
+            return deduplicateProfiles(profiles);
+        }
+
+        LinkedHashMap<String, Integer> scheduler = schedulerOptions(capabilities);
+        LinkedHashMap<String, Integer> experimental = combinedOptions(standard, legacy);
+        int nonVendorOptionCount = experimental.size();
+        addMediaTekVendorOptions(experimental, capabilities);
+        if (experimental.size() > nonVendorOptionCount) {
+            experimental.putAll(scheduler);
+            addProfile(profiles, "mtk-experimental-full", experimental);
+        }
+
+        if (!standard.isEmpty() && !legacy.isEmpty() && !scheduler.isEmpty()) {
+            addProfile(profiles, "mtk-standard-legacy-performance",
+                    combinedOptions(standard, legacy, scheduler));
+        }
+        if (!standard.isEmpty() && !scheduler.isEmpty()) {
+            addProfile(profiles, "mtk-standard-performance",
+                    combinedOptions(standard, scheduler));
+        }
+        addProfile(profiles, "android-standard", standard);
+        if (!legacy.isEmpty() && !scheduler.isEmpty()) {
+            addProfile(profiles, "mtk-legacy-performance",
+                    combinedOptions(legacy, scheduler));
+        }
+        addProfile(profiles, "mtk-legacy", legacy);
+        addProfile(profiles, "performance-only", scheduler);
+        return deduplicateProfiles(profiles);
+    }
+
+    private static List<Profile> planGenericLegacy(Capabilities capabilities) {
+        List<Profile> profiles = new ArrayList<>();
+        addProfile(profiles, "android-standard", standardOptions(capabilities));
+        addProfile(profiles, "legacy-vdec", legacyOptions(capabilities));
+        return deduplicateProfiles(profiles);
+    }
+
     private static LinkedHashMap<String, Integer> qtiBaseOptions(
             Capabilities capabilities,
             boolean qtiCore,
@@ -231,6 +329,72 @@ final class LowLatencyProfilePlanner {
         return options;
     }
 
+    private static LinkedHashMap<String, Integer> legacyOptions(Capabilities capabilities) {
+        LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
+        if (capabilities.legacyVdecLowLatencyAllowed) {
+            options.put(VDEC_LOW_LATENCY, 1);
+        }
+        return options;
+    }
+
+    @SafeVarargs
+    private static LinkedHashMap<String, Integer> combinedOptions(
+            Map<String, Integer>... optionSets) {
+        LinkedHashMap<String, Integer> combined = new LinkedHashMap<>();
+        for (Map<String, Integer> optionSet : optionSets) {
+            combined.putAll(optionSet);
+        }
+        return combined;
+    }
+
+    private static LinkedHashMap<String, Integer> schedulerOptions(
+            Capabilities capabilities) {
+        LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
+        addScheduler(options, capabilities);
+        return options;
+    }
+
+    private static void addMediaTekVendorOptions(LinkedHashMap<String, Integer> options,
+                                                  Capabilities capabilities) {
+        addAdvertisedOption(options, capabilities, MTK_LOW_LATENCY_MODE, 1);
+        addAdvertisedOption(options, capabilities, MTK_DISABLE_IDLE, 1);
+        addAdvertisedOption(options, capabilities, MTK_VSYNC_ADJUST_ENABLE, 0);
+        addAdvertisedOption(options, capabilities, MTK_ULTRA_LOW_LATENCY, 1);
+        addAdvertisedOption(options, capabilities, MTK_PRELOAD_FRAME_COUNT, 0);
+        addAdvertisedOption(options, capabilities, MTK_INPUT_QUEUE_DEPTH, 2);
+        addAdvertisedOption(options, capabilities, MTK_OUTPUT_QUEUE_DEPTH, 2);
+        addAdvertisedAlias(options, capabilities,
+                MTK_FETCH_TIMEOUT, MTK_FETCH_TIMEOUT_VALUE, 2);
+        addAdvertisedAlias(options, capabilities,
+                MTK_GUARD_INTERVAL, MTK_GUARD_INTERVAL_VALUE, 2);
+        addAdvertisedAlias(options, capabilities,
+                MTK_CPU_BOOST, MTK_CPU_BOOST_VALUE, 1);
+        addAdvertisedOption(options, capabilities, MTK_DVFS_MODE, 1);
+        addAdvertisedOption(options, capabilities, MTK_DVFS_LEVEL, 1);
+    }
+
+    private static void addAdvertisedOption(LinkedHashMap<String, Integer> options,
+                                             Capabilities capabilities,
+                                             String key,
+                                             int value) {
+        if (supportsVendorParameter(capabilities, key)) {
+            options.put(key, value);
+        }
+    }
+
+    private static void addAdvertisedAlias(LinkedHashMap<String, Integer> options,
+                                            Capabilities capabilities,
+                                            String primary,
+                                            String alternate,
+                                            int value) {
+        if (supportsVendorParameter(capabilities, alternate)) {
+            options.put(alternate, value);
+        }
+        else if (supportsVendorParameter(capabilities, primary)) {
+            options.put(primary, value);
+        }
+    }
+
     private static void addPreferredFence(LinkedHashMap<String, Integer> options,
                                           boolean outputFence,
                                           boolean softwareFence) {
@@ -257,6 +421,15 @@ final class LowLatencyProfilePlanner {
         return capabilities.sdkInt >= 31 &&
                 capabilities.vendorParameterEnumerationAvailable &&
                 capabilities.supportedVendorParameters.contains(parameter.toLowerCase(Locale.US));
+    }
+
+    private static boolean startsWithAny(String value, String... prefixes) {
+        for (String prefix : prefixes) {
+            if (value.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void addProfile(List<Profile> profiles,
