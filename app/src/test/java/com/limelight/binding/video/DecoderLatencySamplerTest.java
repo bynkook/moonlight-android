@@ -5,6 +5,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 import android.media.MediaCodec;
@@ -225,6 +226,27 @@ public class DecoderLatencySamplerTest {
     }
 
     @Test
+    public void recoveryClearSeversEveryRetainedDuplicatePtsLink() {
+        MediaCodecDecoderRenderer.DecoderLatencyState state =
+                new MediaCodecDecoderRenderer.DecoderLatencyState();
+        MediaCodecDecoderRenderer.DecoderLatencyState.PendingInputToken first =
+                state.onInputQueueCallStarting(77L, 0, 1_000L);
+        MediaCodecDecoderRenderer.DecoderLatencyState.PendingInputToken second =
+                state.onInputQueueCallStarting(77L, 0, 2_000L);
+        MediaCodecDecoderRenderer.DecoderLatencyState.PendingInputToken third =
+                state.onInputQueueCallStarting(77L, 0, 3_000L);
+        assertSame(second, first.next);
+        assertSame(third, second.next);
+
+        state.clearPendingForCodecInvalidation();
+
+        assertNull(first.next);
+        assertNull(second.next);
+        assertNull(third.next);
+        assertEquals(-1, state.onOutputDequeued(77L, 103_000L));
+    }
+
+    @Test
     public void newSessionResetClearsPendingSamplesAndSummaryGuard() {
         MediaCodecDecoderRenderer.DecoderLatencyState state =
                 new MediaCodecDecoderRenderer.DecoderLatencyState();
@@ -236,6 +258,27 @@ public class DecoderLatencySamplerTest {
 
         assertEquals(0, state.copySamplesForCrash().length);
         assertNotNull(state.takeSamplesForStop());
+    }
+
+    @Test
+    public void newSessionResetSeversEveryRetainedDuplicatePtsLink() {
+        MediaCodecDecoderRenderer.DecoderLatencyState state =
+                new MediaCodecDecoderRenderer.DecoderLatencyState();
+        MediaCodecDecoderRenderer.DecoderLatencyState.PendingInputToken first =
+                state.onInputQueueCallStarting(77L, 0, 1_000L);
+        MediaCodecDecoderRenderer.DecoderLatencyState.PendingInputToken second =
+                state.onInputQueueCallStarting(77L, 0, 2_000L);
+        MediaCodecDecoderRenderer.DecoderLatencyState.PendingInputToken third =
+                state.onInputQueueCallStarting(77L, 0, 3_000L);
+        assertSame(second, first.next);
+        assertSame(third, second.next);
+
+        state.resetForNewSession();
+
+        assertNull(first.next);
+        assertNull(second.next);
+        assertNull(third.next);
+        assertEquals(-1, state.onOutputDequeued(77L, 103_000L));
     }
 
     @Test
@@ -252,6 +295,27 @@ public class DecoderLatencySamplerTest {
         assertArrayEquals(new int[]{100}, state.takeSamplesForStop());
         assertNull(state.takeSamplesForStop());
         assertEquals(0, state.copySamplesForCrash().length);
+    }
+
+    @Test
+    public void stopSnapshotSeversEveryRetainedDuplicatePtsLink() {
+        MediaCodecDecoderRenderer.DecoderLatencyState state =
+                new MediaCodecDecoderRenderer.DecoderLatencyState();
+        MediaCodecDecoderRenderer.DecoderLatencyState.PendingInputToken first =
+                state.onInputQueueCallStarting(77L, 0, 1_000L);
+        MediaCodecDecoderRenderer.DecoderLatencyState.PendingInputToken second =
+                state.onInputQueueCallStarting(77L, 0, 2_000L);
+        MediaCodecDecoderRenderer.DecoderLatencyState.PendingInputToken third =
+                state.onInputQueueCallStarting(77L, 0, 3_000L);
+        assertSame(second, first.next);
+        assertSame(third, second.next);
+
+        assertNotNull(state.takeSamplesForStop());
+
+        assertNull(first.next);
+        assertNull(second.next);
+        assertNull(third.next);
+        assertEquals(-1, state.onOutputDequeued(77L, 103_000L));
     }
 
     @Test

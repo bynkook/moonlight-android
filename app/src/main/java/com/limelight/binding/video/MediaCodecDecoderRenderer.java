@@ -317,6 +317,16 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
 
         private void clearPendingLocked() {
+            // These chains are append-only and mutated only under lock, so each walk
+            // terminates. This O(number of pending inputs) work is lifecycle-only.
+            for (int i = 0; i < pendingHeadByPtsUs.size(); i++) {
+                PendingInputToken current = pendingHeadByPtsUs.valueAt(i);
+                while (current != null) {
+                    PendingInputToken next = current.next;
+                    current.next = null;
+                    current = next;
+                }
+            }
             pendingHeadByPtsUs.clear();
             pendingTailByPtsUs.clear();
         }
