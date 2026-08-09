@@ -628,33 +628,16 @@ public class MediaCodecHelper {
         // the first MediaFormat that doesn't fail in configure().
 
         if (isDecoderInList(qualcommDecoderPrefixes, decoderInfo.getName())) {
-            VendorParameterSnapshot snapshot = vendorParameterCapabilities.getSnapshot(
-                    decoderInfo.getName(), Build.VERSION.SDK_INT);
-            LowLatencyProfilePlanner.Capabilities capabilities =
-                    new LowLatencyProfilePlanner.Capabilities(
-                            LowLatencyProfilePlanner.DecoderFamily.QUALCOMM,
-                            decoderInfo.getName(),
-                            Build.VERSION.SDK_INT,
-                            decoderSupportsAndroidRLowLatency(
-                                    decoderInfo, videoFormat.getString(MediaFormat.KEY_MIME)),
-                            decoderSupportsMaxOperatingRate(decoderInfo.getName()),
-                            false,
-                            snapshot.enumerationAvailable,
-                            snapshot.supportedParameters);
-            List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
-                    capabilities,
+            return setDecoderLowLatencyOptions(
+                    videoFormat,
+                    decoderInfo,
                     ultraLowLatency,
-                    LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
-
-            if (tryNumber < 0 || tryNumber >= profiles.size()) {
-                return false;
-            }
-
-            LowLatencyProfilePlanner.Profile profile = profiles.get(tryNumber);
-            for (Map.Entry<String, Integer> option : profile.integerOptions.entrySet()) {
-                videoFormat.setInteger(option.getKey(), option.getValue());
-            }
-            return true;
+                    tryNumber,
+                    vendorParameterCapabilities,
+                    Build.VERSION.SDK_INT,
+                    decoderSupportsAndroidRLowLatency(
+                            decoderInfo, videoFormat.getString(MediaFormat.KEY_MIME)),
+                    decoderSupportsMaxOperatingRate(decoderInfo.getName()));
         }
 
         boolean setNewOption = false;
@@ -796,6 +779,47 @@ public class MediaCodecHelper {
         }
 
         return setNewOption;
+    }
+
+    static boolean setDecoderLowLatencyOptions(
+            MediaFormat videoFormat,
+            MediaCodecInfo decoderInfo,
+            boolean ultraLowLatency,
+            int tryNumber,
+            VendorParameterCapabilityStore capabilityStore,
+            int sdkInt,
+            boolean androidLowLatencySupported,
+            boolean maxOperatingRateSupported) {
+        if (!isDecoderInList(qualcommDecoderPrefixes, decoderInfo.getName()) || tryNumber < 0) {
+            return false;
+        }
+
+        VendorParameterSnapshot snapshot = capabilityStore.getSnapshot(
+                decoderInfo.getName(), sdkInt);
+        LowLatencyProfilePlanner.Capabilities capabilities =
+                new LowLatencyProfilePlanner.Capabilities(
+                        LowLatencyProfilePlanner.DecoderFamily.QUALCOMM,
+                        decoderInfo.getName(),
+                        sdkInt,
+                        androidLowLatencySupported,
+                        maxOperatingRateSupported,
+                        false,
+                        snapshot.enumerationAvailable,
+                        snapshot.supportedParameters);
+        List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
+                capabilities,
+                ultraLowLatency,
+                LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
+
+        if (tryNumber >= profiles.size()) {
+            return false;
+        }
+
+        LowLatencyProfilePlanner.Profile profile = profiles.get(tryNumber);
+        for (Map.Entry<String, Integer> option : profile.integerOptions.entrySet()) {
+            videoFormat.setInteger(option.getKey(), option.getValue());
+        }
+        return true;
     }
 
     public static boolean decoderSupportsFusedIdrFrame(MediaCodecInfo decoderInfo, String mimeType) {
