@@ -2,12 +2,20 @@ package com.limelight.binding.video;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
+import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
 
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.robolectric.RobolectricTestRunner;
+import org.robolectric.annotation.Config;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -17,7 +25,10 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
+@RunWith(RobolectricTestRunner.class)
+@Config(sdk = {33})
 public class LowLatencyProfilePlannerTest {
     private static final String MTK_LOW_LATENCY_MODE =
             "vendor.mtk.vdec.low-latency.mode";
@@ -677,6 +688,184 @@ public class LowLatencyProfilePlannerTest {
         assertEquals(Collections.singletonList("legacy-vdec"), profileNames(legacyOnly));
         assertEquals(options(LowLatencyProfilePlanner.VDEC_LOW_LATENCY, 1),
                 legacyOnly.get(0).integerOptions);
+    }
+
+    @Test
+    public void capabilityLogFiltersSortsAndFormatsSuccessfulEnumerationExactly() {
+        AtomicInteger opens = new AtomicInteger();
+        MediaCodecHelper.VendorParameterCapabilityStore store =
+                new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
+                    opens.incrementAndGet();
+                    return session(Arrays.asList(
+                            "vendor.unknown.parameter",
+                            LowLatencyProfilePlanner.QTI_PICTURE_ORDER,
+                            "Vendor.QTI-Ext-Dec-Low-Latency.Enable"));
+                });
+        MediaCodecInfo decoderInfo = mock(MediaCodecInfo.class);
+        when(decoderInfo.getName()).thenReturn("c2.qti.avc.decoder");
+
+        MediaCodecHelper.LowLatencyConfigurationPlan plan =
+                MediaCodecHelper.createDecoderLowLatencyPlan(
+                        decoderInfo,
+                        "video/avc",
+                        true,
+                        LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION,
+                        store,
+                        33,
+                        true,
+                        true,
+                        "Samsung");
+
+        assertEquals(1, opens.get());
+        assertEquals(MediaCodecHelper.VendorEnumerationStatus.SUCCESS,
+                plan.vendorEnumerationStatus);
+        assertEquals(Arrays.asList(
+                        LowLatencyProfilePlanner.QTI_CORE,
+                        LowLatencyProfilePlanner.QTI_PICTURE_ORDER),
+                plan.advertisedLowLatencyParameters);
+        assertEquals(
+                "CodecLLCapability decoder=c2.qti.avc.decoder mime=video/avc " +
+                        "featureLowLatency=true vendorEnumeration=success " +
+                        "advertisedLowLatencyParameters=[vendor.qti-ext-dec-low-latency.enable, " +
+                        "vendor.qti-ext-dec-picture-order.enable] ullPreference=true",
+                MediaCodecHelper.formatCapabilityLog(plan));
+
+        assertNotNull(plan.getProfile(0));
+        assertNotNull(plan.getProfile(1));
+        assertEquals(1, opens.get());
+    }
+
+    @Test
+    public void capabilityEnumerationIsTriStateAndFailureRetriesOnlyOnLaterPlan() {
+        AtomicInteger opens = new AtomicInteger();
+        MediaCodecHelper.VendorParameterCapabilityStore failingStore =
+                new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
+                    opens.incrementAndGet();
+                    throw new Exception("enumeration failed");
+                });
+        MediaCodecInfo decoderInfo = mock(MediaCodecInfo.class);
+        when(decoderInfo.getName()).thenReturn("c2.qti.avc.decoder");
+
+        MediaCodecHelper.LowLatencyConfigurationPlan first = createPlan(
+                decoderInfo, failingStore, 33);
+        assertEquals(MediaCodecHelper.VendorEnumerationStatus.FAILURE,
+                first.vendorEnumerationStatus);
+        assertEquals(Collections.emptyList(), first.advertisedLowLatencyParameters);
+        assertNotNull(first.getProfile(0));
+        assertNull(first.getProfile(100));
+        assertEquals(1, opens.get());
+
+        MediaCodecHelper.LowLatencyConfigurationPlan second = createPlan(
+                decoderInfo, failingStore, 33);
+        assertEquals(MediaCodecHelper.VendorEnumerationStatus.FAILURE,
+                second.vendorEnumerationStatus);
+        assertEquals(2, opens.get());
+
+        AtomicInteger unsupportedOpens = new AtomicInteger();
+        MediaCodecHelper.VendorParameterCapabilityStore unsupportedStore =
+                new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
+                    unsupportedOpens.incrementAndGet();
+                    throw new AssertionError("API 30 must not enumerate vendor parameters");
+                });
+        MediaCodecHelper.LowLatencyConfigurationPlan unsupported = createPlan(
+                decoderInfo, unsupportedStore, 30);
+        assertEquals(MediaCodecHelper.VendorEnumerationStatus.NOT_SUPPORTED,
+                unsupported.vendorEnumerationStatus);
+        assertEquals(0, unsupportedOpens.get());
+        assertTrue(MediaCodecHelper.formatCapabilityLog(unsupported).contains(
+                "vendorEnumeration=not_supported"));
+    }
+
+    @Test
+    public void configurationPlanEnumeratesKnownParametersForOtherDecoderFamilies() {
+        AtomicInteger opens = new AtomicInteger();
+        MediaCodecHelper.VendorParameterCapabilityStore store =
+                new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
+                    opens.incrementAndGet();
+                    return session(Arrays.asList(
+                            "vendor.rtc-ext-dec-low-latency.enable",
+                            "vendor.nvidia.disable-output-reorder",
+                            "vendor.unrelated.option"));
+                });
+        MediaCodecInfo decoderInfo = mock(MediaCodecInfo.class);
+        when(decoderInfo.getName()).thenReturn("c2.vendor.avc.decoder");
+
+        MediaCodecHelper.LowLatencyConfigurationPlan plan =
+                MediaCodecHelper.createDecoderLowLatencyPlan(
+                        decoderInfo,
+                        "video/avc",
+                        true,
+                        LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION,
+                        store,
+                        33,
+                        true,
+                        true,
+                        "Amazon");
+
+        assertEquals(1, opens.get());
+        assertEquals(MediaCodecHelper.VendorEnumerationStatus.SUCCESS,
+                plan.vendorEnumerationStatus);
+        assertEquals(Arrays.asList(
+                        "vendor.nvidia.disable-output-reorder",
+                        "vendor.rtc-ext-dec-low-latency.enable"),
+                plan.advertisedLowLatencyParameters);
+    }
+
+    @Test
+    public void diagnosticAttemptFallbackAndSelectionFormattingIsExactAndOrdered() {
+        MediaCodecDecoderRenderer.DecoderConfigurationProfile profile =
+                MediaCodecDecoderRenderer.DecoderConfigurationProfile.from(
+                        new MediaCodecHelper.AppliedLowLatencyOptions(
+                                3,
+                                "qti-core-picture",
+                                options(
+                                        LowLatencyProfilePlanner.QTI_CORE, 1,
+                                        LowLatencyProfilePlanner.QTI_PICTURE_ORDER, 1)));
+
+        String attempt = MediaCodecDecoderRenderer.formatLowLatencyAttempt(2, profile);
+        assertEquals(
+                "CodecLLAttempt ordinal=2 profileIndex=3 profileName=qti-core-picture " +
+                        "requestedOptions={vendor.qti-ext-dec-low-latency.enable=1, " +
+                        "vendor.qti-ext-dec-picture-order.enable=1}",
+                attempt);
+        assertFalse(attempt.contains("supported"));
+        assertEquals(
+                "CodecLLFallback profileIndex=3 profileName=qti-core-picture " +
+                        "reason=IllegalStateException",
+                MediaCodecDecoderRenderer.formatLowLatencyFallback(
+                        profile, new IllegalStateException("codec rejected options")));
+        assertEquals(
+                "CodecLLSelected profileIndex=3 profileName=qti-core-picture",
+                MediaCodecDecoderRenderer.formatLowLatencySelected(profile));
+    }
+
+    private static MediaCodecHelper.LowLatencyConfigurationPlan createPlan(
+            MediaCodecInfo decoderInfo,
+            MediaCodecHelper.VendorParameterCapabilityStore store,
+            int sdkInt) {
+        return MediaCodecHelper.createDecoderLowLatencyPlan(
+                decoderInfo,
+                "video/avc",
+                true,
+                LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION,
+                store,
+                sdkInt,
+                true,
+                true,
+                "Samsung");
+    }
+
+    private static MediaCodecHelper.VendorParameterSession session(List<String> parameters) {
+        return new MediaCodecHelper.VendorParameterSession() {
+            @Override
+            public List<String> getSupportedVendorParameters() {
+                return parameters;
+            }
+
+            @Override
+            public void release() {
+            }
+        };
     }
 
     private static LowLatencyProfilePlanner.Capabilities capabilities(
