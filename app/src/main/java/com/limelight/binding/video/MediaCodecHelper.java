@@ -4,9 +4,14 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -54,6 +59,100 @@ public class MediaCodecHelper {
     private static boolean isLowEndSnapdragon = false;
     private static boolean isAdreno620 = false;
     private static boolean initialized = false;
+
+    interface VendorParameterSession {
+        List<String> getSupportedVendorParameters() throws Exception;
+        void release();
+    }
+
+    interface VendorParameterProvider {
+        VendorParameterSession open(String decoderName) throws Exception;
+    }
+
+    static final class VendorParameterSnapshot {
+        final boolean enumerationAvailable;
+        final Set<String> supportedParameters;
+
+        private VendorParameterSnapshot(boolean enumerationAvailable,
+                                        Set<String> supportedParameters) {
+            this.enumerationAvailable = enumerationAvailable;
+            this.supportedParameters = Collections.unmodifiableSet(
+                    new LinkedHashSet<>(supportedParameters));
+        }
+
+        private static VendorParameterSnapshot unavailable() {
+            return new VendorParameterSnapshot(false, Collections.emptySet());
+        }
+    }
+
+    static final class VendorParameterCapabilityStore {
+        private final VendorParameterProvider provider;
+        private final Map<String, VendorParameterSnapshot> cache = new HashMap<>();
+
+        VendorParameterCapabilityStore(VendorParameterProvider provider) {
+            this.provider = provider;
+        }
+
+        synchronized VendorParameterSnapshot getSnapshot(String decoderName, int sdkInt) {
+            if (sdkInt < Build.VERSION_CODES.S) {
+                return VendorParameterSnapshot.unavailable();
+            }
+
+            String normalizedDecoderName = decoderName.toLowerCase(Locale.US);
+            VendorParameterSnapshot cachedSnapshot = cache.get(normalizedDecoderName);
+            if (cachedSnapshot != null) {
+                return cachedSnapshot;
+            }
+
+            VendorParameterSession session = null;
+            try {
+                session = provider.open(decoderName);
+                TreeSet<String> normalizedParameters = new TreeSet<>();
+                for (String parameter : session.getSupportedVendorParameters()) {
+                    if (parameter != null) {
+                        normalizedParameters.add(parameter.toLowerCase(Locale.US));
+                    }
+                }
+
+                VendorParameterSnapshot snapshot =
+                        new VendorParameterSnapshot(true, normalizedParameters);
+                cache.put(normalizedDecoderName, snapshot);
+                return snapshot;
+            }
+            catch (Exception e) {
+                LimeLog.warning("Unable to enumerate vendor parameters for " + decoderName +
+                        ": " + e.getMessage());
+                return VendorParameterSnapshot.unavailable();
+            }
+            finally {
+                if (session != null) {
+                    try {
+                        session.release();
+                    }
+                    catch (RuntimeException e) {
+                        LimeLog.warning("Unable to release vendor parameter probe for " +
+                                decoderName + ": " + e.getMessage());
+                    }
+                }
+            }
+        }
+    }
+
+    private static final VendorParameterCapabilityStore vendorParameterCapabilities =
+            new VendorParameterCapabilityStore(decoderName -> {
+                final MediaCodec codec = MediaCodec.createByCodecName(decoderName);
+                return new VendorParameterSession() {
+                    @Override
+                    public List<String> getSupportedVendorParameters() {
+                        return codec.getSupportedVendorParameters();
+                    }
+
+                    @Override
+                    public void release() {
+                        codec.release();
+                    }
+                };
+            });
 
     static {
         directSubmitPrefixes = new LinkedList<>();
@@ -220,7 +319,11 @@ public class MediaCodecHelper {
     static {
         knownVendorLowLatencyOptions = new LinkedList<>();
 
-        knownVendorLowLatencyOptions.add("vendor.qti-ext-dec-low-latency.enable");
+        knownVendorLowLatencyOptions.add(LowLatencyProfilePlanner.QTI_CORE);
+        knownVendorLowLatencyOptions.add(LowLatencyProfilePlanner.QTI_PICTURE_ORDER);
+        knownVendorLowLatencyOptions.add(LowLatencyProfilePlanner.QTI_SOFTWARE_FENCE);
+        knownVendorLowLatencyOptions.add(LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE);
+        knownVendorLowLatencyOptions.add(LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_TYPE);
         knownVendorLowLatencyOptions.add("vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-req");
         knownVendorLowLatencyOptions.add("vendor.rtc-ext-dec-low-latency.enable");
         knownVendorLowLatencyOptions.add("vendor.low-latency.enable");
@@ -484,31 +587,21 @@ public class MediaCodecHelper {
     }
 
     private static boolean decoderSupportsKnownVendorLowLatencyOption(String decoderName) {
-        // It's only possible to probe vendor parameters on Android 12 and above.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            MediaCodec testCodec = null;
-            try {
-                // Unfortunately we have to create an actual codec instance to get supported options.
-                testCodec = MediaCodec.createByCodecName(decoderName);
+        VendorParameterSnapshot snapshot = vendorParameterCapabilities.getSnapshot(
+                decoderName, Build.VERSION.SDK_INT);
+        if (!snapshot.enumerationAvailable) {
+            return false;
+        }
 
-                // See if any of the vendor parameters match ones we know about
-                for (String supportedOption : testCodec.getSupportedVendorParameters()) {
-                    for (String knownLowLatencyOption : knownVendorLowLatencyOptions) {
-                        if (supportedOption.equalsIgnoreCase(knownLowLatencyOption)) {
-                            LimeLog.info(decoderName + " supports known low latency option: " + supportedOption);
-                            return true;
-                        }
-                    }
-                }
-            } catch (Exception e) {
-                // Tolerate buggy codecs
-                e.printStackTrace();
-            } finally {
-                if (testCodec != null) {
-                    testCodec.release();
-                }
+        for (String knownLowLatencyOption : knownVendorLowLatencyOptions) {
+            if (snapshot.supportedParameters.contains(
+                    knownLowLatencyOption.toLowerCase(Locale.US))) {
+                LimeLog.info(decoderName + " supports known low latency option: " +
+                        knownLowLatencyOption);
+                return true;
             }
         }
+
         return false;
     }
 
@@ -533,6 +626,36 @@ public class MediaCodecHelper {
     public static boolean setDecoderLowLatencyOptions(MediaFormat videoFormat, MediaCodecInfo decoderInfo, boolean ultraLowLatency, int tryNumber) {
         // Options here should be tried in the order of most to least risky. The decoder will use
         // the first MediaFormat that doesn't fail in configure().
+
+        if (isDecoderInList(qualcommDecoderPrefixes, decoderInfo.getName())) {
+            VendorParameterSnapshot snapshot = vendorParameterCapabilities.getSnapshot(
+                    decoderInfo.getName(), Build.VERSION.SDK_INT);
+            LowLatencyProfilePlanner.Capabilities capabilities =
+                    new LowLatencyProfilePlanner.Capabilities(
+                            LowLatencyProfilePlanner.DecoderFamily.QUALCOMM,
+                            decoderInfo.getName(),
+                            Build.VERSION.SDK_INT,
+                            decoderSupportsAndroidRLowLatency(
+                                    decoderInfo, videoFormat.getString(MediaFormat.KEY_MIME)),
+                            decoderSupportsMaxOperatingRate(decoderInfo.getName()),
+                            false,
+                            snapshot.enumerationAvailable,
+                            snapshot.supportedParameters);
+            List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
+                    capabilities,
+                    ultraLowLatency,
+                    LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
+
+            if (tryNumber < 0 || tryNumber >= profiles.size()) {
+                return false;
+            }
+
+            LowLatencyProfilePlanner.Profile profile = profiles.get(tryNumber);
+            for (Map.Entry<String, Integer> option : profile.integerOptions.entrySet()) {
+                videoFormat.setInteger(option.getKey(), option.getValue());
+            }
+            return true;
+        }
 
         boolean setNewOption = false;
 
@@ -599,32 +722,6 @@ public class MediaCodecHelper {
             // Try vendor-specific low latency options
             //
             // NOTE: Update knownVendorLowLatencyOptions if you modify this code!
-            if (isDecoderInList(qualcommDecoderPrefixes, decoderInfo.getName())) {
-                // Examples of Qualcomm's vendor extensions for Snapdragon 845:
-                // https://cs.android.com/android/platform/superproject/+/master:hardware/qcom/sdm845/media/mm-video-v4l2/vidc/vdec/src/omx_vdec_extensions.hpp
-                // https://cs.android.com/android/_/android/platform/hardware/qcom/sm8150/media/+/0621ceb1c1b19564999db8293574a0e12952ff6c
-                //
-                // We will first try both, then try vendor.qti-ext-dec-low-latency.enable alone if that fails
-                if (tryNumber < 4) {
-                    // Adjust picture-order flag: 0 for OMX.qcom (disable reordering), 1 for C2.*
-                    boolean __isOmxQcom = decoderInfo.getName() != null &&
-                            decoderInfo.getName().toLowerCase(java.util.Locale.US).startsWith("omx.qcom");
-                    safeSet(videoFormat, "vendor.qti-ext-dec-picture-order.enable", __isOmxQcom ? 0 : 1);
-                    setNewOption = true;
-                }
-                if (tryNumber < 5) {
-                    videoFormat.setInteger("vendor.qti-ext-dec-low-latency.enable", 1);
-
-                    //ALONSOJR1980 - CONFIRMED WORKING: Snapdragon Elite, SD8 gen 3, SD8 gen 2
-                    //latency-wise, software fencing is the most important flag for latest Snapdragons
-                    videoFormat.setInteger("vendor.qti-ext-output-sw-fence-enable.value", 1); //Snapdragon 8 gen 2
-                    videoFormat.setInteger("vendor.qti-ext-output-fence.enable", 1); // Snapdragon 8s Gen 3 and Elite
-                    videoFormat.setInteger("vendor.qti-ext-output-fence.fence_type", 1); // Snapdragon 8s Gen 3 and ELite / 0 = none, 1 = sw, 2 = hw, 3 = hybrid. Best option = 1
-                    ////////////////////////////////////////////////////////////////////////////////
-
-                    setNewOption = true;
-                }
-            }
             // ALONSOJR1980
 //            else if (isDecoderInList(mtkDecoderPrefixes, decoderInfo.getName())) {
 //                if (tryNumber < 4) {
@@ -633,7 +730,7 @@ public class MediaCodecHelper {
 //                    videoFormat.setInteger("vendor.mtk.ext.dolby.vision.cpu-boost", 1);
 //                    videoFormat.setInteger("vendor.mtk.vdec.bq.guard.interval.time.value", 2);
 //                    videoFormat.setInteger("vendor.mtk.vdec.buffer.fetch.timeout.ms.value", 2);
-            else if (isDecoderInList(mtkDecoderPrefixes, decoderInfo.getName())) {
+            if (isDecoderInList(mtkDecoderPrefixes, decoderInfo.getName())) {
                 if (tryNumber < 4) {
                     // --- PRESET: MTK Low-Latency (safe & balanced, no duplicates) ---
 
