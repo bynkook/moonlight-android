@@ -23,6 +23,7 @@ import java.util.LinkedHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -144,14 +145,16 @@ public class DecoderLatencySamplerTest {
     public void failedQueueCancelsOnlyTheExactPendingEntry() {
         MediaCodecDecoderRenderer.DecoderLatencyState state =
                 new MediaCodecDecoderRenderer.DecoderLatencyState();
-        state.onInputQueueCallStarting(77L, 0, 1_000L);
+        MediaCodecDecoderRenderer.DecoderLatencyState.PendingInputToken first =
+                state.onInputQueueCallStarting(77L, 0, 1_000L);
         state.onInputQueueCallStarting(77L, 0, 2_000L);
 
-        state.onInputQueueFailed(77L, 1_000L);
+        state.onInputQueueFailed(first);
         assertEquals(3, state.onOutputDequeued(77L, 5_000L));
 
-        state.onInputQueueCallStarting(88L, 0, 10_000L);
-        state.onInputQueueFailed(88L, 10_000L);
+        MediaCodecDecoderRenderer.DecoderLatencyState.PendingInputToken failed =
+                state.onInputQueueCallStarting(88L, 0, 10_000L);
+        state.onInputQueueFailed(failed);
         assertEquals(-1, state.onOutputDequeued(88L, 20_000L));
 
         try {
@@ -163,6 +166,32 @@ public class DecoderLatencySamplerTest {
             assertEquals("queue failed", expected.getMessage());
         }
         assertEquals(-1, state.onOutputDequeued(99L, System.nanoTime()));
+    }
+
+    @Test
+    public void duplicatePtsFailureRemovesOnlyTheFailedOperationToken() {
+        MediaCodecDecoderRenderer.DecoderLatencyState state =
+                new MediaCodecDecoderRenderer.DecoderLatencyState();
+        state.onInputQueueCallStarting(77L, 0, 1_000L);
+        MediaCodecDecoderRenderer.DecoderLatencyState.PendingInputToken second =
+                state.onInputQueueCallStarting(77L, 0, 2_000L);
+
+        state.onInputQueueFailed(second);
+
+        assertEquals(100, state.onOutputDequeued(77L, 101_000L));
+        assertEquals(-1, state.onOutputDequeued(77L, 201_000L));
+    }
+
+    @Test
+    public void duplicatePtsOutputsConsumeSuccessfulOperationsInFifoOrder() {
+        MediaCodecDecoderRenderer.DecoderLatencyState state =
+                new MediaCodecDecoderRenderer.DecoderLatencyState();
+        state.onInputQueueCallStarting(77L, 0, 10_000L);
+        state.onInputQueueCallStarting(77L, 0, 20_000L);
+
+        assertEquals(100, state.onOutputDequeued(77L, 110_000L));
+        assertEquals(200, state.onOutputDequeued(77L, 220_000L));
+        assertArrayEquals(new int[]{100, 200}, state.copySamplesForCrash());
     }
 
     @Test
@@ -258,38 +287,147 @@ public class DecoderLatencySamplerTest {
     }
 
     @Test
-    public void codecInvalidationCannotSplitPendingInsertFromInputQueueCall()
+    public void blockedInputQueueCallDoesNotBlockUnrelatedOutputConsumption()
             throws Exception {
         MediaCodecDecoderRenderer.DecoderLatencyState state =
                 new MediaCodecDecoderRenderer.DecoderLatencyState();
+        state.onInputQueueCallStarting(11L, 0, 1_000L);
         CountDownLatch queueCallEntered = new CountDownLatch(1);
         CountDownLatch releaseQueueCall = new CountDownLatch(1);
-        CountDownLatch invalidationEntered = new CountDownLatch(1);
+        CountDownLatch outputReturned = new CountDownLatch(1);
+        AtomicInteger latencyUs = new AtomicInteger(-2);
         Thread queueThread = new Thread(() -> state.runInputQueueCall(
-                77L,
+                22L,
                 0,
                 (presentationTimeUs, codecFlags) -> {
                     queueCallEntered.countDown();
                     awaitUnchecked(releaseQueueCall);
                 }));
-        Thread invalidationThread = new Thread(() ->
-                state.clearPendingAndRunCodecInvalidation(
-                        invalidationEntered::countDown));
+        Thread outputThread = new Thread(() -> {
+            latencyUs.set(state.onOutputDequeued(11L, 101_000L));
+            outputReturned.countDown();
+        });
 
         queueThread.start();
         assertTrue(queueCallEntered.await(5, TimeUnit.SECONDS));
-        invalidationThread.start();
+        outputThread.start();
+        boolean outputCompleted;
         try {
-            assertFalse(invalidationEntered.await(100, TimeUnit.MILLISECONDS));
+            outputCompleted = outputReturned.await(5, TimeUnit.SECONDS);
         }
         finally {
             releaseQueueCall.countDown();
         }
 
-        assertTrue(invalidationEntered.await(5, TimeUnit.SECONDS));
         queueThread.join();
+        outputThread.join();
+        assertTrue(outputCompleted);
+        assertEquals(100, latencyUs.get());
+    }
+
+    @Test
+    public void invalidationClearsPendingBeforeCodecCallWithoutHoldingLatencyLock()
+            throws Exception {
+        MediaCodecDecoderRenderer.DecoderLatencyState state =
+                new MediaCodecDecoderRenderer.DecoderLatencyState();
+        state.onInputQueueCallStarting(33L, 0, 1_000L);
+        CountDownLatch invalidationEntered = new CountDownLatch(1);
+        CountDownLatch releaseInvalidation = new CountDownLatch(1);
+        CountDownLatch outputReturned = new CountDownLatch(1);
+        AtomicInteger latencyUs = new AtomicInteger(-2);
+        Thread invalidationThread = new Thread(() ->
+                state.clearPendingAndRunCodecInvalidation(() -> {
+                    invalidationEntered.countDown();
+                    awaitUnchecked(releaseInvalidation);
+                }));
+        Thread outputThread = new Thread(() -> {
+            latencyUs.set(state.onOutputDequeued(33L, 101_000L));
+            outputReturned.countDown();
+        });
+
+        invalidationThread.start();
+        assertTrue(invalidationEntered.await(5, TimeUnit.SECONDS));
+        outputThread.start();
+        boolean outputCompleted;
+        try {
+            outputCompleted = outputReturned.await(5, TimeUnit.SECONDS);
+        }
+        finally {
+            releaseInvalidation.countDown();
+        }
+
         invalidationThread.join();
-        assertEquals(-1, state.onOutputDequeued(77L, System.nanoTime()));
+        outputThread.join();
+        assertTrue(outputCompleted);
+        assertEquals(-1, latencyUs.get());
+    }
+
+    @Test
+    public void inputQueueCallOverlappingInvalidationRunsButIsNotTracked()
+            throws Exception {
+        MediaCodecDecoderRenderer.DecoderLatencyState state =
+                new MediaCodecDecoderRenderer.DecoderLatencyState();
+        CountDownLatch invalidationEntered = new CountDownLatch(1);
+        CountDownLatch releaseInvalidation = new CountDownLatch(1);
+        CountDownLatch queueCallEntered = new CountDownLatch(1);
+        Thread invalidationThread = new Thread(() ->
+                state.clearPendingAndRunCodecInvalidation(() -> {
+                    invalidationEntered.countDown();
+                    awaitUnchecked(releaseInvalidation);
+                }));
+        Thread queueThread = new Thread(() -> state.runInputQueueCall(
+                44L, 0, (presentationTimeUs, codecFlags) ->
+                        queueCallEntered.countDown()));
+
+        invalidationThread.start();
+        assertTrue(invalidationEntered.await(5, TimeUnit.SECONDS));
+        queueThread.start();
+        boolean queueCallCompleted;
+        try {
+            queueCallCompleted = queueCallEntered.await(5, TimeUnit.SECONDS);
+        }
+        finally {
+            releaseInvalidation.countDown();
+        }
+
+        invalidationThread.join();
+        queueThread.join();
+        assertTrue(queueCallCompleted);
+        assertEquals(-1, state.onOutputDequeued(44L, System.nanoTime()));
+    }
+
+    @Test
+    public void codecConfigQueueCallDoesNotAcquireLatencyLockDuringInvalidation()
+            throws Exception {
+        MediaCodecDecoderRenderer.DecoderLatencyState state =
+                new MediaCodecDecoderRenderer.DecoderLatencyState();
+        CountDownLatch invalidationEntered = new CountDownLatch(1);
+        CountDownLatch releaseInvalidation = new CountDownLatch(1);
+        CountDownLatch queueCallEntered = new CountDownLatch(1);
+        Thread invalidationThread = new Thread(() ->
+                state.clearPendingAndRunCodecInvalidation(() -> {
+                    invalidationEntered.countDown();
+                    awaitUnchecked(releaseInvalidation);
+                }));
+        Thread queueThread = new Thread(() -> state.runInputQueueCall(
+                0L,
+                MediaCodec.BUFFER_FLAG_CODEC_CONFIG,
+                (presentationTimeUs, codecFlags) -> queueCallEntered.countDown()));
+
+        invalidationThread.start();
+        assertTrue(invalidationEntered.await(5, TimeUnit.SECONDS));
+        queueThread.start();
+        boolean queueCallCompleted;
+        try {
+            queueCallCompleted = queueCallEntered.await(5, TimeUnit.SECONDS);
+        }
+        finally {
+            releaseInvalidation.countDown();
+        }
+
+        invalidationThread.join();
+        queueThread.join();
+        assertTrue(queueCallCompleted);
     }
 
     @Test

@@ -143,10 +143,31 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             void queue(long presentationTimeUs, int codecFlags);
         }
 
+        static final class PendingInputToken {
+            final long presentationTimeUs;
+            final long capturedNs;
+            final long generation;
+            PendingInputToken next;
+
+            private PendingInputToken(long presentationTimeUs,
+                                      long capturedNs,
+                                      long generation) {
+                this.presentationTimeUs = presentationTimeUs;
+                this.capturedNs = capturedNs;
+                this.generation = generation;
+            }
+        }
+
         private final Object lock;
-        private final LongSparseArray<Long> pendingQueueCallStartNsByPtsUs =
+        // One token object replaces the boxed Long timestamp used previously. The second
+        // sparse array adds no per-input object and keeps duplicate-PTS append O(1).
+        private final LongSparseArray<PendingInputToken> pendingHeadByPtsUs =
+                new LongSparseArray<>();
+        private final LongSparseArray<PendingInputToken> pendingTailByPtsUs =
                 new LongSparseArray<>();
         private final DecoderLatencySampler sampler = new DecoderLatencySampler();
+        private long pendingGeneration;
+        private int codecInvalidationDepth;
         private boolean stopSummaryTaken;
 
         DecoderLatencyState() {
@@ -157,72 +178,153 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             this.lock = lock;
         }
 
-        void onInputQueueCallStarting(long presentationTimeUs,
-                                      int codecFlags,
-                                      long capturedNs) {
+        PendingInputToken onInputQueueCallStarting(long presentationTimeUs,
+                                                   int codecFlags,
+                                                   long capturedNs) {
             if ((codecFlags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-                return;
+                return null;
             }
             synchronized (lock) {
-                pendingQueueCallStartNsByPtsUs.put(presentationTimeUs, capturedNs);
+                return codecInvalidationDepth == 0 ?
+                        appendPendingLocked(presentationTimeUs, capturedNs) : null;
             }
         }
 
-        void onInputQueueFailed(long presentationTimeUs, long capturedNs) {
+        private PendingInputToken appendPendingLocked(long presentationTimeUs,
+                                                       long capturedNs) {
+            PendingInputToken token = new PendingInputToken(
+                    presentationTimeUs, capturedNs, pendingGeneration);
+            PendingInputToken tail = pendingTailByPtsUs.get(presentationTimeUs);
+            if (tail == null) {
+                pendingHeadByPtsUs.put(presentationTimeUs, token);
+            }
+            else {
+                tail.next = token;
+            }
+            pendingTailByPtsUs.put(presentationTimeUs, token);
+            return token;
+        }
+
+        void onInputQueueFailed(PendingInputToken token) {
+            if (token == null) {
+                return;
+            }
             synchronized (lock) {
-                Long pendingCapturedNs =
-                        pendingQueueCallStartNsByPtsUs.get(presentationTimeUs);
-                if (pendingCapturedNs != null && pendingCapturedNs == capturedNs) {
-                    pendingQueueCallStartNsByPtsUs.delete(presentationTimeUs);
+                removePendingTokenLocked(token);
+            }
+        }
+
+        private void removePendingTokenLocked(PendingInputToken token) {
+            if (token == null || token.generation != pendingGeneration) {
+                return;
+            }
+
+            PendingInputToken previous = null;
+            PendingInputToken current = pendingHeadByPtsUs.get(token.presentationTimeUs);
+            while (current != null && current != token) {
+                previous = current;
+                current = current.next;
+            }
+            if (current == null) {
+                return;
+            }
+
+            if (previous == null) {
+                if (current.next == null) {
+                    pendingHeadByPtsUs.delete(token.presentationTimeUs);
+                }
+                else {
+                    pendingHeadByPtsUs.put(token.presentationTimeUs, current.next);
                 }
             }
+            else {
+                previous.next = current.next;
+            }
+
+            if (pendingTailByPtsUs.get(token.presentationTimeUs) == current) {
+                if (previous == null) {
+                    pendingTailByPtsUs.delete(token.presentationTimeUs);
+                }
+                else {
+                    pendingTailByPtsUs.put(token.presentationTimeUs, previous);
+                }
+            }
+            current.next = null;
         }
 
         void runInputQueueCall(long presentationTimeUs,
                                int codecFlags,
                                InputQueueCall inputQueueCall) {
+            if ((codecFlags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                inputQueueCall.queue(presentationTimeUs, codecFlags);
+                return;
+            }
+
+            PendingInputToken token;
             synchronized (lock) {
-                long capturedNs = System.nanoTime();
-                onInputQueueCallStarting(presentationTimeUs, codecFlags, capturedNs);
-                try {
-                    inputQueueCall.queue(presentationTimeUs, codecFlags);
-                }
-                catch (RuntimeException e) {
-                    onInputQueueFailed(presentationTimeUs, capturedNs);
-                    throw e;
-                }
+                token = codecInvalidationDepth == 0 ?
+                        appendPendingLocked(presentationTimeUs, System.nanoTime()) : null;
+            }
+            try {
+                inputQueueCall.queue(presentationTimeUs, codecFlags);
+            }
+            catch (RuntimeException e) {
+                onInputQueueFailed(token);
+                throw e;
             }
         }
 
         int onOutputDequeued(long presentationTimeUs, long dequeuedNs) {
             synchronized (lock) {
-                Long queueCallStartNs =
-                        pendingQueueCallStartNsByPtsUs.get(presentationTimeUs);
-                if (queueCallStartNs == null) {
+                PendingInputToken token = pendingHeadByPtsUs.get(presentationTimeUs);
+                if (token == null) {
                     return -1;
                 }
 
-                pendingQueueCallStartNsByPtsUs.delete(presentationTimeUs);
-                return sampler.recordDeltaNs(queueCallStartNs, dequeuedNs);
+                if (token.next == null) {
+                    pendingHeadByPtsUs.delete(presentationTimeUs);
+                    pendingTailByPtsUs.delete(presentationTimeUs);
+                }
+                else {
+                    pendingHeadByPtsUs.put(presentationTimeUs, token.next);
+                }
+                token.next = null;
+                return sampler.recordDeltaNs(token.capturedNs, dequeuedNs);
             }
         }
 
         void clearPendingForCodecInvalidation() {
             synchronized (lock) {
-                pendingQueueCallStartNsByPtsUs.clear();
+                pendingGeneration++;
+                clearPendingLocked();
             }
         }
 
         void clearPendingAndRunCodecInvalidation(Runnable codecInvalidation) {
             synchronized (lock) {
-                pendingQueueCallStartNsByPtsUs.clear();
+                pendingGeneration++;
+                codecInvalidationDepth++;
+                clearPendingLocked();
+            }
+            try {
                 codecInvalidation.run();
             }
+            finally {
+                synchronized (lock) {
+                    codecInvalidationDepth--;
+                }
+            }
+        }
+
+        private void clearPendingLocked() {
+            pendingHeadByPtsUs.clear();
+            pendingTailByPtsUs.clear();
         }
 
         void resetForNewSession() {
             synchronized (lock) {
-                pendingQueueCallStartNsByPtsUs.clear();
+                pendingGeneration++;
+                clearPendingLocked();
                 sampler.reset();
                 stopSummaryTaken = false;
             }
@@ -241,7 +343,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 }
 
                 stopSummaryTaken = true;
-                pendingQueueCallStartNsByPtsUs.clear();
+                pendingGeneration++;
+                clearPendingLocked();
                 int[] samples = sampler.copySamples();
                 sampler.reset();
                 return samples;
