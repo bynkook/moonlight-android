@@ -2,6 +2,8 @@ package com.limelight.binding.video;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -62,6 +64,36 @@ public class MediaCodecLowLatencyCapabilityTest {
     @Before
     public void initializeCodecHelper() {
         MediaCodecHelper.initialize(RuntimeEnvironment.getApplication(), "Adreno 740");
+    }
+
+    @Test
+    public void appliedOptionsAreNamedIndexedOrderedImmutableAndDefensive() {
+        LinkedHashMap<String, Integer> source = new LinkedHashMap<>();
+        source.put("first", 1);
+        source.put("second", 2);
+
+        MediaCodecHelper.AppliedLowLatencyOptions applied =
+                new MediaCodecHelper.AppliedLowLatencyOptions(3, "named-profile", source);
+        source.put("third", 3);
+
+        assertEquals(3, applied.profileIndex);
+        assertEquals("named-profile", applied.profileName);
+        assertEquals(Arrays.asList("first", "second"),
+                Arrays.asList(applied.integerOptions.keySet().toArray(new String[0])));
+        assertEquals(options("first", 1, "second", 2), applied.integerOptions);
+        try {
+            applied.integerOptions.put("mutation", 4);
+            fail("Applied options must be immutable");
+        }
+        catch (UnsupportedOperationException expected) {
+            // Expected.
+        }
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void appliedOptionsRejectEmptyMaps() {
+        new MediaCodecHelper.AppliedLowLatencyOptions(
+                0, "invalid-empty", Collections.emptyMap());
     }
 
     @Test
@@ -273,7 +305,8 @@ public class MediaCodecLowLatencyCapabilityTest {
 
         for (int tryNumber = 0; tryNumber < expectedProfiles.size(); tryNumber++) {
             MediaFormat format = videoFormat();
-            assertTrue(MediaCodecHelper.setDecoderLowLatencyOptions(
+            MediaCodecHelper.AppliedLowLatencyOptions applied =
+                    MediaCodecHelper.setDecoderLowLatencyOptions(
                     format,
                     decoderInfo,
                     true,
@@ -281,14 +314,22 @@ public class MediaCodecLowLatencyCapabilityTest {
                     store,
                     33,
                     true,
-                    true));
+                    true);
+            assertNotNull(applied);
+            assertEquals(tryNumber, applied.profileIndex);
+            assertEquals(Arrays.asList(
+                    "qti-experimental-full",
+                    "qti-experimental-no-scheduler",
+                    "qti-no-fence",
+                    "android-standard").get(tryNumber), applied.profileName);
+            assertEquals(expectedProfiles.get(tryNumber), applied.integerOptions);
             assertEquals(expectedProfiles.get(tryNumber).keySet(), optionKeys(format));
             assertEquals(expectedProfiles.get(tryNumber), lowLatencyOptions(format));
         }
 
         MediaFormat exhausted = videoFormat();
         String exhaustedBefore = exhausted.toString();
-        assertFalse(MediaCodecHelper.setDecoderLowLatencyOptions(
+        assertNull(MediaCodecHelper.setDecoderLowLatencyOptions(
                 exhausted,
                 decoderInfo,
                 true,
@@ -311,7 +352,8 @@ public class MediaCodecLowLatencyCapabilityTest {
         when(decoderInfo.getName()).thenReturn("c2.qti.hevc.decoder.low_latency");
 
         MediaFormat standard = videoFormat();
-        assertTrue(MediaCodecHelper.setDecoderLowLatencyOptions(
+        MediaCodecHelper.AppliedLowLatencyOptions applied =
+                MediaCodecHelper.setDecoderLowLatencyOptions(
                 standard,
                 decoderInfo,
                 false,
@@ -319,14 +361,17 @@ public class MediaCodecLowLatencyCapabilityTest {
                 store,
                 33,
                 true,
-                true));
+                true);
+        assertNotNull(applied);
+        assertEquals(0, applied.profileIndex);
+        assertEquals("android-standard", applied.profileName);
         assertEquals(options(MediaFormat.KEY_LOW_LATENCY, 1),
                 lowLatencyOptions(standard));
 
         for (int invalidAttempt : Arrays.asList(-1, 1, 100)) {
             MediaFormat untouched = videoFormat();
             String untouchedBefore = untouched.toString();
-            assertFalse(MediaCodecHelper.setDecoderLowLatencyOptions(
+            assertNull(MediaCodecHelper.setDecoderLowLatencyOptions(
                     untouched,
                     decoderInfo,
                     false,
@@ -341,7 +386,7 @@ public class MediaCodecLowLatencyCapabilityTest {
     }
 
     @Test
-    public void injectableHelperRejectsNonQualcommWithoutOpeningProvider() {
+    public void injectableHelperUsesStandardForNonQualcommWithoutOpeningProvider() {
         AtomicInteger openCount = new AtomicInteger();
         MediaCodecHelper.VendorParameterCapabilityStore store =
                 new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
@@ -349,11 +394,12 @@ public class MediaCodecLowLatencyCapabilityTest {
                     throw new AssertionError("Non-Qualcomm decoder must not probe QTI parameters");
                 });
         MediaCodecInfo decoderInfo = mock(MediaCodecInfo.class);
-        when(decoderInfo.getName()).thenReturn("c2.exynos.avc.decoder");
+        when(decoderInfo.getName()).thenReturn("c2.vendor.avc.decoder");
         MediaFormat format = videoFormat();
         String before = format.toString();
 
-        assertFalse(MediaCodecHelper.setDecoderLowLatencyOptions(
+        MediaCodecHelper.AppliedLowLatencyOptions applied =
+                MediaCodecHelper.setDecoderLowLatencyOptions(
                 format,
                 decoderInfo,
                 true,
@@ -361,8 +407,11 @@ public class MediaCodecLowLatencyCapabilityTest {
                 store,
                 33,
                 true,
-                true));
-        assertEquals(before, format.toString());
+                true);
+        assertNotNull(applied);
+        assertEquals("android-standard", applied.profileName);
+        assertEquals(options(MediaFormat.KEY_LOW_LATENCY, 1), lowLatencyOptions(format));
+        assertFalse(before.equals(format.toString()));
         assertEquals(0, openCount.get());
     }
 
@@ -405,7 +454,8 @@ public class MediaCodecLowLatencyCapabilityTest {
 
         for (int tryNumber = 0; tryNumber < expectedProfiles.size(); tryNumber++) {
             MediaFormat format = videoFormat();
-            assertTrue(MediaCodecHelper.setDecoderLowLatencyOptions(
+            MediaCodecHelper.AppliedLowLatencyOptions applied =
+                    MediaCodecHelper.setDecoderLowLatencyOptions(
                     format,
                     decoderInfo,
                     true,
@@ -414,14 +464,17 @@ public class MediaCodecLowLatencyCapabilityTest {
                     33,
                     true,
                     true,
-                    "Samsung"));
+                    "Samsung");
+            assertNotNull(applied);
+            assertEquals(tryNumber, applied.profileIndex);
+            assertEquals(expectedProfiles.get(tryNumber), applied.integerOptions);
             assertEquals(expectedProfiles.get(tryNumber).keySet(), optionKeys(format));
             assertEquals(expectedProfiles.get(tryNumber), lowLatencyOptions(format));
         }
 
         MediaFormat exhausted = videoFormat();
         String exhaustedBefore = exhausted.toString();
-        assertFalse(MediaCodecHelper.setDecoderLowLatencyOptions(
+        assertNull(MediaCodecHelper.setDecoderLowLatencyOptions(
                 exhausted,
                 decoderInfo,
                 true,
@@ -449,18 +502,18 @@ public class MediaCodecLowLatencyCapabilityTest {
         when(decoderInfo.getName()).thenReturn("OMX.AMLOGIC.video.decoder.avc");
 
         MediaFormat standard = videoFormat();
-        assertTrue(MediaCodecHelper.setDecoderLowLatencyOptions(
+        assertNotNull(MediaCodecHelper.setDecoderLowLatencyOptions(
                 standard, decoderInfo, true, 0, store, 33, true, true, "Google"));
         assertEquals(options(MediaFormat.KEY_LOW_LATENCY, 1), lowLatencyOptions(standard));
 
         MediaFormat legacy = videoFormat();
-        assertTrue(MediaCodecHelper.setDecoderLowLatencyOptions(
+        assertNotNull(MediaCodecHelper.setDecoderLowLatencyOptions(
                 legacy, decoderInfo, true, 1, store, 33, true, true, "Google"));
         assertEquals(options(LowLatencyProfilePlanner.VDEC_LOW_LATENCY, 1),
                 lowLatencyOptions(legacy));
 
         MediaFormat exhausted = videoFormat();
-        assertFalse(MediaCodecHelper.setDecoderLowLatencyOptions(
+        assertNull(MediaCodecHelper.setDecoderLowLatencyOptions(
                 exhausted, decoderInfo, true, 2, store, 33, true, true, "Google"));
         assertTrue(lowLatencyOptions(exhausted).isEmpty());
         assertEquals(0, openCount.get());
@@ -468,23 +521,40 @@ public class MediaCodecLowLatencyCapabilityTest {
 
     @Test
     public void nonEligibleExynosAndNvidiaProductionPathsRemainActive() {
+        MediaCodecHelper.VendorParameterCapabilityStore unusedStore =
+                new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
+                    throw new AssertionError("Legacy paths must not enumerate vendor parameters");
+                });
         MediaCodecInfo exynosInfo = mock(MediaCodecInfo.class);
         when(exynosInfo.getName()).thenReturn("c2.exynos.avc.decoder");
         MediaFormat exynos = videoFormat();
-        assertTrue(MediaCodecHelper.setDecoderLowLatencyOptions(
-                exynos, exynosInfo, true, 3));
+        MediaCodecHelper.AppliedLowLatencyOptions exynosApplied =
+                MediaCodecHelper.setDecoderLowLatencyOptions(
+                        exynos, exynosInfo, true, 0,
+                        unusedStore, 33, false, false, "Samsung");
+        assertNotNull(exynosApplied);
+        assertEquals("exynos-legacy", exynosApplied.profileName);
         assertEquals(1,
                 exynos.getInteger("vendor.rtc-ext-dec-low-latency.enable"));
 
         MediaCodecInfo nvidiaInfo = mock(MediaCodecInfo.class);
         when(nvidiaInfo.getName()).thenReturn("c2.nvidia.avc.decoder");
         MediaFormat nvidia = videoFormat();
-        assertTrue(MediaCodecHelper.setDecoderLowLatencyOptions(
-                nvidia, nvidiaInfo, true, 4));
+        MediaCodecHelper.AppliedLowLatencyOptions nvidiaApplied =
+                MediaCodecHelper.setDecoderLowLatencyOptions(
+                        nvidia, nvidiaInfo, true, 0,
+                        unusedStore, 33, false, false, "NVIDIA");
+        assertNotNull(nvidiaApplied);
+        assertEquals("nvidia-legacy", nvidiaApplied.profileName);
         assertEquals(1, nvidia.getInteger("media.low-latency.enable"));
         assertEquals(1, nvidia.getInteger("vendor.low-latency.enable"));
         assertEquals(1, nvidia.getInteger("disable-output-reorder"));
         assertEquals(1, nvidia.getInteger("vendor.nvidia.disable-output-reorder"));
+
+        assertNull(MediaCodecHelper.setDecoderLowLatencyOptions(
+                MediaFormat.createVideoFormat("video/avc", 1920, 1080),
+                nvidiaInfo, true, 1,
+                unusedStore, 33, false, false, "NVIDIA"));
     }
 
     private static MediaCodecHelper.VendorParameterCapabilityStore s25Store(

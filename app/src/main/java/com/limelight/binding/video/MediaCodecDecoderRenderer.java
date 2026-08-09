@@ -5,7 +5,11 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -44,6 +48,163 @@ import android.view.Choreographer;
 import android.view.Surface;
 
 public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements Choreographer.FrameCallback {
+    private static final int MAX_DECODER_CONFIGURATION_ATTEMPTS = 12;
+    private static final int MAX_OPTION_PROFILE_ATTEMPTS =
+            MAX_DECODER_CONFIGURATION_ATTEMPTS - 1;
+
+    enum ActiveLowLatencyProfileKind {
+        NON_STANDARD,
+        ANDROID_STANDARD,
+        BASE
+    }
+
+    enum ConfigurationMode {
+        INITIAL,
+        RUNTIME_RECOVERY
+    }
+
+    enum ConfigurationFailureDisposition {
+        TRY_NEXT,
+        RETURN_MINUS_FIVE,
+        RETHROW
+    }
+
+    enum RecoveryStage {
+        TRANSIENT,
+        RESTART,
+        RESET,
+        FULL_RECREATION
+    }
+
+    enum RecoveryAction {
+        REUSE_ACTIVE_CONFIGURATION,
+        RUNTIME_DOWNGRADE
+    }
+
+    interface LowLatencyOptionSource {
+        MediaCodecHelper.AppliedLowLatencyOptions get(int profileIndex);
+    }
+
+    static final class DecoderConfigurationProfile {
+        final int profileIndex;
+        final String profileName;
+        final Map<String, Integer> integerOptions;
+        final ActiveLowLatencyProfileKind kind;
+
+        private DecoderConfigurationProfile(int profileIndex,
+                                            String profileName,
+                                            Map<String, Integer> integerOptions,
+                                            ActiveLowLatencyProfileKind kind) {
+            this.profileIndex = profileIndex;
+            this.profileName = Objects.requireNonNull(profileName);
+            this.integerOptions = Collections.unmodifiableMap(
+                    new LinkedHashMap<>(integerOptions));
+            this.kind = Objects.requireNonNull(kind);
+        }
+
+        static DecoderConfigurationProfile from(
+                MediaCodecHelper.AppliedLowLatencyOptions applied) {
+            ActiveLowLatencyProfileKind kind = "android-standard".equals(applied.profileName) ?
+                    ActiveLowLatencyProfileKind.ANDROID_STANDARD :
+                    ActiveLowLatencyProfileKind.NON_STANDARD;
+            return new DecoderConfigurationProfile(
+                    applied.profileIndex,
+                    applied.profileName,
+                    applied.integerOptions,
+                    kind);
+        }
+
+        static DecoderConfigurationProfile base() {
+            return new DecoderConfigurationProfile(
+                    -1,
+                    "base",
+                    Collections.emptyMap(),
+                    ActiveLowLatencyProfileKind.BASE);
+        }
+    }
+
+    static final class ConfiguredDecoderState {
+        final MediaFormat format;
+        final int profileIndex;
+        final String profileName;
+        final ActiveLowLatencyProfileKind kind;
+
+        private ConfiguredDecoderState(MediaFormat format,
+                                       DecoderConfigurationProfile profile) {
+            this.format = Objects.requireNonNull(format);
+            this.profileIndex = profile.profileIndex;
+            this.profileName = profile.profileName;
+            this.kind = profile.kind;
+        }
+    }
+
+    static List<DecoderConfigurationProfile> selectConfigurationProfiles(
+            int startTry,
+            LowLatencyOptionSource optionSource) {
+        if (startTry < 0) {
+            throw new IllegalArgumentException("startTry must be non-negative");
+        }
+
+        List<DecoderConfigurationProfile> attempts = new ArrayList<>();
+        for (int profileIndex = startTry;
+             profileIndex < MAX_OPTION_PROFILE_ATTEMPTS;
+             profileIndex++) {
+            MediaCodecHelper.AppliedLowLatencyOptions applied = optionSource.get(profileIndex);
+            if (applied == null) {
+                break;
+            }
+            attempts.add(DecoderConfigurationProfile.from(applied));
+        }
+        attempts.add(DecoderConfigurationProfile.base());
+        return Collections.unmodifiableList(attempts);
+    }
+
+    static List<DecoderConfigurationProfile> selectRuntimeRecoveryProfiles(
+            ActiveLowLatencyProfileKind activeKind,
+            LowLatencyOptionSource recoveryOptionSource) {
+        if (activeKind != ActiveLowLatencyProfileKind.NON_STANDARD) {
+            return Collections.singletonList(DecoderConfigurationProfile.base());
+        }
+        return selectConfigurationProfiles(0, recoveryOptionSource);
+    }
+
+    static ConfiguredDecoderState commitConfiguredState(
+            ConfiguredDecoderState current,
+            MediaFormat format,
+            DecoderConfigurationProfile profile,
+            boolean configureAndStartSucceeded) {
+        return configureAndStartSucceeded ?
+                new ConfiguredDecoderState(format, profile) : current;
+    }
+
+    static RecoveryAction recoveryActionFor(RecoveryStage stage) {
+        return stage == RecoveryStage.FULL_RECREATION ?
+                RecoveryAction.RUNTIME_DOWNGRADE :
+                RecoveryAction.REUSE_ACTIVE_CONFIGURATION;
+    }
+
+    static ConfigurationFailureDisposition configurationFailureDisposition(
+            ConfigurationMode mode,
+            DecoderConfigurationProfile profile) {
+        if (profile.kind != ActiveLowLatencyProfileKind.BASE) {
+            return ConfigurationFailureDisposition.TRY_NEXT;
+        }
+        return mode == ConfigurationMode.RUNTIME_RECOVERY ?
+                ConfigurationFailureDisposition.RETHROW :
+                ConfigurationFailureDisposition.RETURN_MINUS_FIVE;
+    }
+
+    static String finalConfigurationFailureMessage(
+            String decoderName,
+            DecoderConfigurationProfile profile,
+            boolean androidLowLatencySupported) {
+        return "Unable to configure decoder=" + decoderName +
+                " profileIndex=" + profile.profileIndex +
+                " profileName=" + profile.profileName +
+                " requestedOptions=" + profile.integerOptions +
+                " FEATURE_LowLatency=" + androidLowLatencySupported;
+    }
+
     // Latency profile: favor minimal end-to-end delay over absolute smoothness.
     // Set true to enable a 'latest-only' fast path in the render loop.
     private boolean preferLowerDelays = false;
@@ -160,7 +321,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
     private MediaFormat inputFormat;
     private MediaFormat outputFormat;
-    private MediaFormat configuredFormat;
+    private ConfiguredDecoderState configuredDecoderState;
 
     private boolean needsBaselineSpsHack;
     private SeqParameterSet savedSps;
@@ -617,10 +778,6 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         } catch (Throwable t) {
             LimeLog.info("Decoder name: <unavailable>");
         }
-
-
-        configuredFormat = format;
-
         // After reconfiguration, we must resubmit CSD buffers
         submittedCsd = false;
         vpsBuffers.clear();
@@ -654,13 +811,18 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
     }
 
-    private boolean tryConfigureDecoder(MediaCodecInfo selectedDecoderInfo, MediaFormat format, boolean throwOnCodecError) {
+    private boolean tryConfigureDecoder(MediaCodecInfo selectedDecoderInfo,
+                                        MediaFormat format,
+                                        DecoderConfigurationProfile profile,
+                                        boolean throwOnCodecError) {
         boolean configured = false;
         try {
             videoDecoder = MediaCodec.createByCodecName(selectedDecoderInfo.getName());
             configureAndStartDecoder(format);
             LimeLog.info("Using codec " + selectedDecoderInfo.getName() + " for hardware decoding " + format.getString(MediaFormat.KEY_MIME));
             configured = true;
+            configuredDecoderState = commitConfiguredState(
+                    configuredDecoderState, format, profile, true);
         } catch (IllegalArgumentException e) {
             e.printStackTrace();
             if (throwOnCodecError) {
@@ -685,7 +847,25 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         return configured;
     }
 
+    private void reconfigureActiveDecoder(RecoveryStage stage) {
+        if (recoveryActionFor(stage) != RecoveryAction.REUSE_ACTIVE_CONFIGURATION ||
+                configuredDecoderState == null) {
+            throw new IllegalStateException("No active decoder configuration to reuse for " + stage);
+        }
+        configureAndStartDecoder(configuredDecoderState.format);
+    }
+
     public int initializeDecoder(boolean throwOnCodecError) {
+        // Runtime recovery uses initializeDecoderForRuntimeRecovery() so the initial path always
+        // preserves the historical -5 return contract for a failed renderer-owned base format.
+        return initializeDecoder(ConfigurationMode.INITIAL);
+    }
+
+    private int initializeDecoderForRuntimeRecovery() {
+        return initializeDecoder(ConfigurationMode.RUNTIME_RECOVERY);
+    }
+
+    private int initializeDecoder(ConfigurationMode configurationMode) {
         String mimeType;
         MediaCodecInfo selectedDecoderInfo;
 
@@ -753,26 +933,69 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         adaptivePlayback = MediaCodecHelper.decoderSupportsAdaptivePlayback(selectedDecoderInfo, mimeType);
         fusedIdrFrame = MediaCodecHelper.decoderSupportsFusedIdrFrame(selectedDecoderInfo, mimeType);
 
-        for (int tryNumber = 0;; tryNumber++) {
-            LimeLog.info("Decoder configuration try: "+tryNumber);
+        ActiveLowLatencyProfileKind activeKindBeforeConfiguration =
+                configuredDecoderState == null ? ActiveLowLatencyProfileKind.BASE :
+                        configuredDecoderState.kind;
+        LowLatencyOptionSource optionSource = profileIndex ->
+                MediaCodecHelper.getDecoderLowLatencyOptions(
+                        selectedDecoderInfo,
+                        mimeType,
+                        prefs.enableUltraLowLatency,
+                        profileIndex,
+                        configurationMode == ConfigurationMode.RUNTIME_RECOVERY ?
+                                LowLatencyProfilePlanner.PlanPurpose.RUNTIME_RECOVERY :
+                                LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
+        List<DecoderConfigurationProfile> configurationProfiles =
+                configurationMode == ConfigurationMode.RUNTIME_RECOVERY ?
+                        selectRuntimeRecoveryProfiles(
+                                activeKindBeforeConfiguration, optionSource) :
+                        selectConfigurationProfiles(0, optionSource);
+        boolean androidLowLatencySupported =
+                MediaCodecHelper.decoderSupportsAndroidRLowLatency(
+                        selectedDecoderInfo, mimeType);
+
+        for (int attemptOrdinal = 0;
+             attemptOrdinal < configurationProfiles.size();
+             attemptOrdinal++) {
+            DecoderConfigurationProfile profile = configurationProfiles.get(attemptOrdinal);
+            LimeLog.info("Decoder configuration attempt=" + attemptOrdinal +
+                    " profileIndex=" + profile.profileIndex +
+                    " profileName=" + profile.profileName +
+                    " requestedOptions=" + profile.integerOptions);
 
             MediaFormat mediaFormat = createBaseMediaFormat(mimeType);
-            // This will try low latency options until we find one that works (or we give up).
-            boolean newFormat = MediaCodecHelper.setDecoderLowLatencyOptions(mediaFormat, selectedDecoderInfo, prefs.enableUltraLowLatency, tryNumber);
+            for (Map.Entry<String, Integer> option : profile.integerOptions.entrySet()) {
+                mediaFormat.setInteger(option.getKey(), option.getValue());
+            }
             //todo 色彩格式
 //            MediaCodecInfo.CodecCapabilities codecCapabilities = selectedDecoderInfo.getCapabilitiesForType(mimeType);
 //            int[] colorFormats=codecCapabilities.colorFormats;
 //            for (int colorFormat : colorFormats) {
 //                LimeLog.info("Decoder configuration colorFormats: "+colorFormat);
 //            }
-            // Throw the underlying codec exception on the last attempt if the caller requested it
-            if (tryConfigureDecoder(selectedDecoderInfo, mediaFormat, !newFormat && throwOnCodecError)) {
+            ConfigurationFailureDisposition failureDisposition =
+                    configurationFailureDisposition(configurationMode, profile);
+            boolean configured;
+            try {
+                configured = tryConfigureDecoder(
+                        selectedDecoderInfo,
+                        mediaFormat,
+                        profile,
+                        failureDisposition == ConfigurationFailureDisposition.RETHROW);
+            }
+            catch (RuntimeException e) {
+                LimeLog.severe(finalConfigurationFailureMessage(
+                        selectedDecoderInfo.getName(), profile, androidLowLatencySupported));
+                throw e;
+            }
+            if (configured) {
                 // Success!
                 break;
             }
 
-            if (!newFormat) {
-                // We couldn't even configure a decoder without any low latency options
+            if (failureDisposition == ConfigurationFailureDisposition.RETURN_MINUS_FIVE) {
+                LimeLog.severe(finalConfigurationFailureMessage(
+                        selectedDecoderInfo.getName(), profile, androidLowLatencySupported));
                 return -5;
             }
         }
@@ -860,7 +1083,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     LimeLog.warning("Trying to restart decoder after CodecException");
                     try {
                         videoDecoder.stop();
-                        configureAndStartDecoder(configuredFormat);
+                        reconfigureActiveDecoder(RecoveryStage.RESTART);
                         codecRecoveryType.set(CR_RECOVERY_TYPE_NONE);
                     } catch (IllegalArgumentException e) {
                         e.printStackTrace();
@@ -883,7 +1106,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     LimeLog.warning("Trying to reset decoder after CodecException");
                     try {
                         videoDecoder.reset();
-                        configureAndStartDecoder(configuredFormat);
+                        reconfigureActiveDecoder(RecoveryStage.RESET);
                         codecRecoveryType.set(CR_RECOVERY_TYPE_NONE);
                     } catch (IllegalArgumentException e) {
                         e.printStackTrace();
@@ -906,7 +1129,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     videoDecoder.release();
 
                     try {
-                        int err = initializeDecoder(true);
+                        int err = initializeDecoderForRuntimeRecovery();
                         if (err != 0) {
                             throw new IllegalStateException("Decoder reset failed: " + err);
                         }
@@ -2355,7 +2578,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     }
                 }
             }
-            str += "Configured format: "+renderer.configuredFormat+DELIMITER;
+            str += "Configured format: "+
+                    (renderer.configuredDecoderState == null ? "<none>" :
+                            renderer.configuredDecoderState.format)+DELIMITER;
             str += "Input format: "+renderer.inputFormat+DELIMITER;
             str += "Output format: "+renderer.outputFormat+DELIMITER;
             str += "Adaptive playback: "+renderer.adaptivePlayback+DELIMITER;
