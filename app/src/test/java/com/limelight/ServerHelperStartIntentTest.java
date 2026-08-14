@@ -91,7 +91,7 @@ public class ServerHelperStartIntentTest {
     }
 
     @Test
-    public void createStartIntent_whenFullyExternalEnabledWithDisplay_wrapsPresentationFallbackGameIntent() {
+    public void createStartIntent_whenFullyExternalEnabledWithDisplay_wrapsRequestedSecondaryGameIntent() {
         setFullyExternalEnabled(true);
         int displayId = ShadowDisplayManager.addDisplay("w1920dp-h1080dp");
 
@@ -102,8 +102,8 @@ public class ServerHelperStartIntentTest {
         Intent gameIntent = wrapperIntent.getParcelableExtra(ExternalDisplayControlActivity.EXTRA_LAUNCH_INTENT);
         assertNotNull(gameIntent);
         assertEquals(Game.class.getName(), gameIntent.getComponent().getClassName());
-        assertEquals(Display.DEFAULT_DISPLAY, gameIntent.getIntExtra(Game.EXTRA_DISPLAY_ID, -1));
-        assertEquals(displayId, gameIntent.getIntExtra(Game.EXTRA_PRESENTATION_DISPLAY_ID, -1));
+        assertEquals(displayId, gameIntent.getIntExtra(Game.EXTRA_DISPLAY_ID, -1));
+        assertFalse(gameIntent.hasExtra(Game.EXTRA_PRESENTATION_DISPLAY_ID));
         assertTrue(gameIntent.getBooleanExtra(Game.EXTRA_VDISPLAY, false));
     }
 

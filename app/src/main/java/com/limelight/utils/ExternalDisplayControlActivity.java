@@ -2,12 +2,15 @@ package com.limelight.utils;
 
 import static com.limelight.StartExternalDisplayControlReceiver.requestFocusToGameActivity;
 import static com.limelight.StartExternalDisplayControlReceiver.requestFocusToExternalDisplayControl;
-import static com.limelight.utils.ServerHelper.getSecondaryDisplay;
 
 import android.annotation.SuppressLint;
+import android.app.ActivityManager;
+import android.app.ActivityOptions;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.hardware.display.DisplayManager;
 import android.graphics.Color;
 import android.os.Build;
 import android.os.Bundle;
@@ -244,6 +247,8 @@ public class ExternalDisplayControlActivity extends AppCompatActivity implements
         if (isGameInstanceAvailable()) {
             if (Game.instance.isInPresentationMode() && presentationState == PresentationState.IDLE) {
                 presentationState = PresentationState.WAITING_FOR_CONTROLLER_FOCUS;
+            } else if (!Game.instance.isInPresentationMode()) {
+                presentationState = PresentationState.IDLE;
             }
             return false;
         }
@@ -257,7 +262,10 @@ public class ExternalDisplayControlActivity extends AppCompatActivity implements
         userLeaving = false;
         finishingFromGame = false;
         presentationState = PresentationState.LAUNCHING_GAME;
-        Display secondaryDisplay = getSecondaryDisplay(this);
+        int requestedDisplayId = gameIntent.getIntExtra(Game.EXTRA_DISPLAY_ID, Display.INVALID_DISPLAY);
+        int selectedDisplayId = gameIntent.getIntExtra(
+                Game.EXTRA_PRESENTATION_DISPLAY_ID, requestedDisplayId);
+        Display secondaryDisplay = getDisplayById(selectedDisplayId);
         if (secondaryDisplay != null) {
             Toast.makeText(this,
                     getString(R.string.external_display_info,
@@ -266,37 +274,139 @@ public class ExternalDisplayControlActivity extends AppCompatActivity implements
                             secondaryDisplay.getMode().getRefreshRate()),
                     Toast.LENGTH_LONG).show();
 
-            boolean launched = startPresentationFallback(gameIntent, secondaryDisplay);
+            boolean launched = startGameWithPresentationFallback(
+                    gameIntent, secondaryDisplay, selectedDisplayId);
             if (!launched) {
                 presentationState = PresentationState.ENDING;
-                LimeLog.warning(getString(R.string.no_external_display));
-                try {
-                    startActivity(gameIntent);
-                } catch (RuntimeException e) {
-                    LimeLog.warning("Starting Game on default display failed: " + e);
-                }
                 finish();
             }
         } else {
             presentationState = PresentationState.ENDING;
-            LimeLog.warning(getString(R.string.no_external_display));
-            startActivity(gameIntent);
+            LimeLog.warning("External display launch requested=" + selectedDisplayId
+                    + " actual=deferred requestedPath=abort fallbackReason=target-unavailable");
             finish();
         }
 
         return true;
     }
 
-    private boolean startPresentationFallback(Intent gameIntent, Display secondaryDisplay) {
-        gameIntent.putExtra(Game.EXTRA_DISPLAY_ID, Display.DEFAULT_DISPLAY);
-        gameIntent.putExtra(Game.EXTRA_PRESENTATION_DISPLAY_ID, secondaryDisplay.getDisplayId());
+    private Display getDisplayById(int displayId) {
+        if (displayId == Display.INVALID_DISPLAY) {
+            return null;
+        }
+
+        DisplayManager displayManager = getSystemService(DisplayManager.class);
+        return displayManager != null ? displayManager.getDisplay(displayId) : null;
+    }
+
+    static boolean shouldAttemptDirectExternalLaunch(int sdkInt,
+                                                     boolean supportsSecondaryActivities,
+                                                     boolean targetExists,
+                                                     boolean startAllowed,
+                                                     boolean hasPresentationTarget) {
+        return sdkInt >= Build.VERSION_CODES.R
+                && supportsSecondaryActivities
+                && targetExists
+                && startAllowed
+                && !hasPresentationTarget;
+    }
+
+    static Intent createPresentationFallbackIntent(Intent sourceIntent, int displayId,
+                                                   String fallbackReason) {
+        Intent fallbackIntent = new Intent(sourceIntent);
+        fallbackIntent.putExtra(Game.EXTRA_DISPLAY_ID, Display.DEFAULT_DISPLAY);
+        fallbackIntent.putExtra(Game.EXTRA_PRESENTATION_DISPLAY_ID, displayId);
+        fallbackIntent.putExtra(Game.EXTRA_EXTERNAL_DISPLAY_FALLBACK_REASON, fallbackReason);
+        return fallbackIntent;
+    }
+
+    static Bundle createDirectExternalLaunchOptions(int displayId) {
+        return ActivityOptions.makeBasic().setLaunchDisplayId(displayId).toBundle();
+    }
+
+    private boolean startGameWithPresentationFallback(Intent sourceIntent,
+                                                      Display secondaryDisplay,
+                                                      int selectedDisplayId) {
+        int requestedDisplayId = sourceIntent.getIntExtra(Game.EXTRA_DISPLAY_ID, Display.INVALID_DISPLAY);
+        boolean hasPresentationTarget = sourceIntent.hasExtra(Game.EXTRA_PRESENTATION_DISPLAY_ID);
+        boolean supportsSecondaryActivities = getPackageManager().hasSystemFeature(
+                PackageManager.FEATURE_ACTIVITIES_ON_SECONDARY_DISPLAYS);
+        boolean startAllowed = false;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && secondaryDisplay != null) {
+            startAllowed = isActivityStartAllowedOnDisplay(secondaryDisplay.getDisplayId(), sourceIntent);
+        }
+
+        String fallbackReason = null;
+        if (shouldAttemptDirectExternalLaunch(
+                Build.VERSION.SDK_INT,
+                supportsSecondaryActivities,
+                secondaryDisplay != null,
+                startAllowed,
+                hasPresentationTarget)) {
+            try {
+                startActivity(new Intent(sourceIntent),
+                        createDirectExternalLaunchOptions(requestedDisplayId));
+                LimeLog.info("External display launch requested=" + requestedDisplayId
+                        + " actual=deferred"
+                        + " requestedPath=direct");
+                return true;
+            } catch (RuntimeException e) {
+                fallbackReason = "launch-exception";
+                LimeLog.warning("External display launch requested=" + requestedDisplayId
+                        + " actual=deferred"
+                        + " requestedPath=direct fallbackReason=launch-exception exception=" + e);
+            }
+        }
+
+        if (fallbackReason == null) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || !supportsSecondaryActivities) {
+                fallbackReason = "not-supported";
+            } else if (hasPresentationTarget) {
+                fallbackReason = "display-mismatch";
+            } else {
+                fallbackReason = "not-allowed";
+            }
+        }
+
+        Intent fallbackIntent = createPresentationFallbackIntent(sourceIntent, selectedDisplayId,
+                fallbackReason);
         try {
-            startActivity(gameIntent);
+            startActivity(fallbackIntent);
+            LimeLog.info("External display launch requested=" + selectedDisplayId
+                    + " actual=deferred"
+                    + " requestedPath=presentation fallbackReason=" + fallbackReason);
             return true;
         } catch (RuntimeException e) {
-            LimeLog.warning("Fallback startActivity (Presentation path) failed: " + e);
+            LimeLog.warning("External display launch requested=" + selectedDisplayId
+                    + " actual=deferred"
+                    + " requestedPath=presentation fallbackReason=" + fallbackReason
+                    + " exception=" + e);
             return false;
         }
+    }
+
+    boolean isActivityStartAllowedOnDisplay(int displayId, Intent gameIntent) {
+        ActivityManager activityManager = getSystemService(ActivityManager.class);
+        return activityManager != null && activityManager.isActivityStartAllowedOnDisplay(
+                this, displayId, gameIntent);
+    }
+
+    static PresentationState resolvePresentationStateAfterGameInit(PresentationState currentState,
+                                                                   boolean inPresentationMode) {
+        return inPresentationMode ? currentState : PresentationState.IDLE;
+    }
+
+    PresentationState onGameReadyForController(Game game) {
+        presentationState = resolvePresentationStateAfterGameInit(
+                presentationState, game.isInPresentationMode());
+        if (presentationState == PresentationState.IDLE) {
+            requestGameFocus();
+        }
+        return presentationState;
+    }
+
+    void requestGameFocus() {
+        requestFocusToGameActivity(false);
     }
 
     private void initViews() {
@@ -316,6 +426,7 @@ public class ExternalDisplayControlActivity extends AppCompatActivity implements
 
         pendingGameLaunch = false;
         failCount = 0;
+        onGameReadyForController(Game.instance);
 
         WindowInsetsControllerCompat windowInsetsController = WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
 

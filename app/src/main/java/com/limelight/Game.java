@@ -292,6 +292,14 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     public static final String EXTRA_SERVER_COMMANDS = "ServerCommands";
     public static final String EXTRA_DISPLAY_ID = "DisplayID";
     public static final String EXTRA_PRESENTATION_DISPLAY_ID = "PresentationDisplayID";
+    public static final String EXTRA_EXTERNAL_DISPLAY_FALLBACK_REASON = "ExternalDisplayFallbackReason";
+
+    enum ExternalDisplayLaunchMode {
+        NONE,
+        DIRECT,
+        PRESENTATION,
+        ABORT
+    }
 
     public static final String CLIPBOARD_IDENTIFIER = "ArtemisStreaming";
 
@@ -409,24 +417,48 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 getResources().getString(R.string.conn_establishing_msg), true);
 
 
-        Display currentDisplay = null;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            int displayId = getIntent().getIntExtra(EXTRA_DISPLAY_ID, Display.DEFAULT_DISPLAY);
-            DisplayManager displayManager = getSystemService(DisplayManager.class);
-            currentDisplay = displayManager != null ? displayManager.getDisplay(displayId) : null;
-        }
-
+        int requestedDisplayId = getIntent().getIntExtra(EXTRA_DISPLAY_ID, Display.DEFAULT_DISPLAY);
+        int explicitPresentationDisplayId = getIntent().getIntExtra(EXTRA_PRESENTATION_DISPLAY_ID, -1);
+        Display currentDisplay = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                ? getDisplay()
+                : getWindowManager().getDefaultDisplay();
         if (currentDisplay == null) {
             currentDisplay = getWindowManager().getDefaultDisplay();
         }
 
-        onExternelDisplay = currentDisplay.getDisplayId() != Display.DEFAULT_DISPLAY;
-        presentationDisplayId = getIntent().getIntExtra(EXTRA_PRESENTATION_DISPLAY_ID, -1);
-        inPresentationMode = presentationDisplayId != -1;
-        if (inPresentationMode) {
-            LimeLog.info("Game entering Presentation fallback mode for display id=" + presentationDisplayId);
-            onExternelDisplay = false;
+        int targetDisplayId = explicitPresentationDisplayId != -1
+                ? explicitPresentationDisplayId
+                : requestedDisplayId;
+        DisplayManager displayManager = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                ? getSystemService(DisplayManager.class)
+                : null;
+        Display requestedDisplay = targetDisplayId == Display.DEFAULT_DISPLAY
+                ? currentDisplay
+                : displayManager != null ? displayManager.getDisplay(targetDisplayId) : null;
+        ExternalDisplayLaunchMode launchMode = resolveExternalDisplayLaunch(
+                requestedDisplayId,
+                currentDisplay.getDisplayId(),
+                requestedDisplay != null,
+                explicitPresentationDisplayId);
+        String fallbackReason = resolveExternalDisplayFallbackReason(launchMode,
+                getIntent().getStringExtra(EXTRA_EXTERNAL_DISPLAY_FALLBACK_REASON));
+        LimeLog.info("External display launch requested=" + targetDisplayId
+                + " actual=" + currentDisplay.getDisplayId()
+                + " path=" + launchMode.name().toLowerCase()
+                + " fallbackReason=" + fallbackReason);
+        if (launchMode == ExternalDisplayLaunchMode.ABORT) {
+            if (spinner != null) {
+                spinner.dismiss();
+                spinner = null;
+            }
+            Toast.makeText(this, R.string.no_external_display, Toast.LENGTH_LONG).show();
+            finish();
+            return;
         }
+
+        onExternelDisplay = launchMode == ExternalDisplayLaunchMode.DIRECT;
+        inPresentationMode = launchMode == ExternalDisplayLaunchMode.PRESENTATION;
+        presentationDisplayId = inPresentationMode ? targetDisplayId : -1;
 
         if (onExternelDisplay) {
             externalDisplayId = currentDisplay.getDisplayId();
@@ -438,7 +470,6 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
         Display presentationDisplay = null;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && inPresentationMode) {
-            DisplayManager displayManager = getSystemService(DisplayManager.class);
             presentationDisplay = displayManager != null ? displayManager.getDisplay(presentationDisplayId) : null;
         }
         Display renderDisplay = chooseRenderDisplayForPresentation(currentDisplay, presentationDisplay, inPresentationMode);
@@ -1564,6 +1595,39 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     static boolean shouldApplyDisplayModeToActivityWindow(boolean inPresentationMode) {
         return !inPresentationMode;
+    }
+
+    static ExternalDisplayLaunchMode resolveExternalDisplayLaunch(int requestedDisplayId,
+                                                                   int actualDisplayId,
+                                                                   boolean targetExists,
+                                                                   int explicitPresentationDisplayId) {
+        if (explicitPresentationDisplayId != -1) {
+            return targetExists ? ExternalDisplayLaunchMode.PRESENTATION
+                    : ExternalDisplayLaunchMode.ABORT;
+        }
+        if (requestedDisplayId == Display.DEFAULT_DISPLAY) {
+            return ExternalDisplayLaunchMode.NONE;
+        }
+        if (!targetExists) {
+            return ExternalDisplayLaunchMode.ABORT;
+        }
+        return requestedDisplayId == actualDisplayId ? ExternalDisplayLaunchMode.DIRECT
+                : ExternalDisplayLaunchMode.PRESENTATION;
+    }
+
+    static String resolveExternalDisplayFallbackReason(ExternalDisplayLaunchMode launchMode,
+                                                       String controllerFallbackReason) {
+        if (launchMode == ExternalDisplayLaunchMode.ABORT) {
+            return "target-unavailable";
+        }
+
+        if (controllerFallbackReason != null) {
+            return controllerFallbackReason;
+        }
+
+        return launchMode == ExternalDisplayLaunchMode.PRESENTATION
+                ? "display-mismatch"
+                : "none";
     }
 
     static boolean shouldKeepExternalPresentationAliveOnStop(boolean onExternalDisplay,

@@ -1,6 +1,7 @@
 package com.limelight;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
@@ -38,30 +39,6 @@ public class ExternalDisplayControlActivityLaunchTest {
     }
 
     @Test
-    public void startsWrappedGameIntentAsPresentationFallbackWithoutLaunchDisplayOptions() {
-        int displayId = ShadowDisplayManager.addDisplay("w1920dp-h1080dp");
-        Intent gameIntent = new Intent();
-        gameIntent.setClassName("com.limelight", Game.class.getName());
-
-        Intent wrapperIntent = new Intent();
-        wrapperIntent.setClassName("com.limelight", ExternalDisplayControlActivity.class.getName());
-        wrapperIntent.putExtra(ExternalDisplayControlActivity.EXTRA_LAUNCH_INTENT, gameIntent);
-
-        ExternalDisplayControlActivity activity = Robolectric
-                .buildActivity(ExternalDisplayControlActivity.class, wrapperIntent)
-                .create()
-                .get();
-
-        ShadowActivity.IntentForResult started = Shadows.shadowOf(activity).getNextStartedActivityForResult();
-        assertNotNull(started);
-        assertEquals(Game.class.getName(), started.intent.getComponent().getClassName());
-        assertEquals(Display.DEFAULT_DISPLAY, started.intent.getIntExtra(Game.EXTRA_DISPLAY_ID, -1));
-        assertEquals(displayId, started.intent.getIntExtra(Game.EXTRA_PRESENTATION_DISPLAY_ID, -1));
-        assertNull(started.options);
-        assertNull(Shadows.shadowOf(activity).getNextStartedActivityForResult());
-    }
-
-    @Test
     public void controllerWindowKeepsScreenOnDuringLaunch() {
         ShadowDisplayManager.addDisplay("w1920dp-h1080dp");
         Intent gameIntent = new Intent();
@@ -81,11 +58,12 @@ public class ExternalDisplayControlActivityLaunchTest {
     }
 
     @Test
-    public void reusedWrapperStartsWrappedGameIntentFromNewIntent() {
+    public void reusedWrapperDoesNotMutateTheWrappedIntentWithFallbackExtras() {
         int displayId = ShadowDisplayManager.addDisplay("w1920dp-h1080dp");
 
         Intent initialGameIntent = new Intent();
         initialGameIntent.setClassName("com.limelight", Game.class.getName());
+        initialGameIntent.putExtra(Game.EXTRA_DISPLAY_ID, displayId);
 
         Intent initialWrapperIntent = new Intent();
         initialWrapperIntent.setClassName("com.limelight", ExternalDisplayControlActivity.class.getName());
@@ -101,6 +79,7 @@ public class ExternalDisplayControlActivityLaunchTest {
 
         Intent secondGameIntent = new Intent();
         secondGameIntent.setClassName("com.limelight", Game.class.getName());
+        secondGameIntent.putExtra(Game.EXTRA_DISPLAY_ID, displayId);
 
         Intent secondWrapperIntent = new Intent();
         secondWrapperIntent.setClassName("com.limelight", ExternalDisplayControlActivity.class.getName());
@@ -113,7 +92,7 @@ public class ExternalDisplayControlActivityLaunchTest {
         assertEquals(Game.class.getName(), started.intent.getComponent().getClassName());
         assertEquals(Display.DEFAULT_DISPLAY, started.intent.getIntExtra(Game.EXTRA_DISPLAY_ID, -1));
         assertEquals(displayId, started.intent.getIntExtra(Game.EXTRA_PRESENTATION_DISPLAY_ID, -1));
-        assertNull(started.options);
+        assertFalse(secondGameIntent.hasExtra(Game.EXTRA_PRESENTATION_DISPLAY_ID));
         assertNull(Shadows.shadowOf(activity).getNextStartedActivityForResult());
     }
 
@@ -141,4 +120,5 @@ public class ExternalDisplayControlActivityLaunchTest {
         assertEquals(displayId, started.intent.getIntExtra(Game.EXTRA_PRESENTATION_DISPLAY_ID, -1));
         assertNull(started.options);
     }
+
 }

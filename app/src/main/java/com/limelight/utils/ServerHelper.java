@@ -130,8 +130,7 @@ public class ServerHelper {
 
         if (secondaryDisplay != null) {
             int secondaryDisplayId = secondaryDisplay.getDisplayId();
-            gameIntent.putExtra(Game.EXTRA_DISPLAY_ID, Display.DEFAULT_DISPLAY);
-            gameIntent.putExtra(Game.EXTRA_PRESENTATION_DISPLAY_ID, secondaryDisplayId);
+            gameIntent.putExtra(Game.EXTRA_DISPLAY_ID, secondaryDisplayId);
             Intent touchpadIntent = new Intent(parent, ExternalDisplayControlActivity.class);
             touchpadIntent.putExtra(ExternalDisplayControlActivity.EXTRA_LAUNCH_INTENT, gameIntent);
             return touchpadIntent;
