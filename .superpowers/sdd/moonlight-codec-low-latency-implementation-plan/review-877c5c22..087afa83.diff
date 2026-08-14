@@ -1,0 +1,147 @@
+# Review package: 877c5c22a11ee783fc2b33bc4c151587ee36cfc6..087afa8300fdcb5a4131cfadeddd9af04f853391
+
+## Commits
+087afa83 Add testable codec low-latency profile planner
+
+## Files changed
+ .../binding/video/LowLatencyProfilePlanner.java    | 58 +++++++++++++++++++
+ .../video/LowLatencyProfilePlannerTest.java        | 66 ++++++++++++++++++++++
+ 2 files changed, 124 insertions(+)
+
+## Diff
+diff --git a/app/src/main/java/com/limelight/binding/video/LowLatencyProfilePlanner.java b/app/src/main/java/com/limelight/binding/video/LowLatencyProfilePlanner.java
+new file mode 100644
+index 00000000..205a18d7
+--- /dev/null
++++ b/app/src/main/java/com/limelight/binding/video/LowLatencyProfilePlanner.java
+@@ -0,0 +1,58 @@
++package com.limelight.binding.video;
++
++import java.util.AbstractMap;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Objects;
++
++final class LowLatencyProfilePlanner {
++    static final class Profile {
++        final String name;
++        final Map<String, Integer> integerOptions;
++
++        private final List<Map.Entry<String, Integer>> orderedOptions;
++
++        Profile(String name, Map<String, Integer> integerOptions) {
++            this.name = Objects.requireNonNull(name);
++
++            LinkedHashMap<String, Integer> optionsCopy = new LinkedHashMap<>(integerOptions);
++            this.integerOptions = Collections.unmodifiableMap(optionsCopy);
++
++            List<Map.Entry<String, Integer>> entries = new ArrayList<>(optionsCopy.size());
++            for (Map.Entry<String, Integer> entry : optionsCopy.entrySet()) {
++                entries.add(new AbstractMap.SimpleImmutableEntry<>(entry));
++            }
++            this.orderedOptions = Collections.unmodifiableList(entries);
++        }
++
++        @Override
++        public boolean equals(Object other) {
++            if (this == other) {
++                return true;
++            }
++            if (!(other instanceof Profile)) {
++                return false;
++            }
++
++            Profile otherProfile = (Profile) other;
++            return orderedOptions.equals(otherProfile.orderedOptions);
++        }
++
++        @Override
++        public int hashCode() {
++            return orderedOptions.hashCode();
++        }
++    }
++
++    static List<Profile> deduplicateProfiles(List<Profile> profiles) {
++        LinkedHashSet<Profile> uniqueProfiles = new LinkedHashSet<>(profiles);
++        return Collections.unmodifiableList(new ArrayList<>(uniqueProfiles));
++    }
++
++    private LowLatencyProfilePlanner() {
++    }
++}
+diff --git a/app/src/test/java/com/limelight/binding/video/LowLatencyProfilePlannerTest.java b/app/src/test/java/com/limelight/binding/video/LowLatencyProfilePlannerTest.java
+new file mode 100644
+index 00000000..a2268396
+--- /dev/null
++++ b/app/src/test/java/com/limelight/binding/video/LowLatencyProfilePlannerTest.java
+@@ -0,0 +1,66 @@
++package com.limelight.binding.video;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.fail;
++
++import org.junit.Test;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++import java.util.List;
++
++public class LowLatencyProfilePlannerTest {
++    @Test
++    public void profileOptionsAreOrderedAndImmutable() {
++        LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
++        options.put("low-latency", 1);
++        options.put("vendor.test.option", 2);
++
++        LowLatencyProfilePlanner.Profile profile =
++                new LowLatencyProfilePlanner.Profile("test-profile", options);
++        options.put("added-after-construction", 3);
++
++        assertEquals(
++                Arrays.asList("low-latency", "vendor.test.option"),
++                new ArrayList<>(profile.integerOptions.keySet()));
++
++        try {
++            profile.integerOptions.put("mutation", 4);
++            fail("Profile options must be immutable");
++        }
++        catch (UnsupportedOperationException expected) {
++            // Expected.
++        }
++    }
++
++    @Test
++    public void duplicateOrderedOptionsAreRemoved() {
++        LowLatencyProfilePlanner.Profile first = profile(
++                "first", "low-latency", 1, "vendor.test.option", 2);
++        LowLatencyProfilePlanner.Profile duplicate = profile(
++                "duplicate", "low-latency", 1, "vendor.test.option", 2);
++        LowLatencyProfilePlanner.Profile reverseOrder = profile(
++                "reverse-order", "vendor.test.option", 2, "low-latency", 1);
++
++        List<LowLatencyProfilePlanner.Profile> profiles =
++                LowLatencyProfilePlanner.deduplicateProfiles(
++                        Arrays.asList(first, duplicate, reverseOrder));
++
++        assertEquals(2, profiles.size());
++        assertEquals("first", profiles.get(0).name);
++        assertEquals("reverse-order", profiles.get(1).name);
++    }
++
++    private static LowLatencyProfilePlanner.Profile profile(
++            String name,
++            String firstKey,
++            int firstValue,
++            String secondKey,
++            int secondValue) {
++        LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
++        options.put(firstKey, firstValue);
++        options.put(secondKey, secondValue);
++        return new LowLatencyProfilePlanner.Profile(name, options);
++    }
++}

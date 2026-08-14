@@ -1,0 +1,1275 @@
+# Review package: ee2910ca2a6233fbfe736a162bea47b5a183e54d..1d85dc3eac630bcdd43b6447c286b482106ea8b7
+
+## Commits
+1d85dc3e Bound and strengthen MediaTek low-latency fallbacks
+
+## Files changed
+ .../binding/video/LowLatencyProfilePlanner.java    | 173 +++++++++
+ .../limelight/binding/video/MediaCodecHelper.java  | 175 ++++-----
+ .../video/LowLatencyProfilePlannerTest.java        | 431 +++++++++++++++++++++
+ .../video/MediaCodecLowLatencyCapabilityTest.java  | 133 +++++++
+ 4 files changed, 814 insertions(+), 98 deletions(-)
+
+## Diff
+diff --git a/app/src/main/java/com/limelight/binding/video/LowLatencyProfilePlanner.java b/app/src/main/java/com/limelight/binding/video/LowLatencyProfilePlanner.java
+index 23eabdde..5e68c9cc 100644
+--- a/app/src/main/java/com/limelight/binding/video/LowLatencyProfilePlanner.java
++++ b/app/src/main/java/com/limelight/binding/video/LowLatencyProfilePlanner.java
+@@ -17,20 +17,36 @@ import java.util.TreeSet;
+ final class LowLatencyProfilePlanner {
+     static final String VDEC_LOW_LATENCY = "vdec-lowlatency";
+ 
+     static final String QTI_CORE = "vendor.qti-ext-dec-low-latency.enable";
+     static final String QTI_PICTURE_ORDER = "vendor.qti-ext-dec-picture-order.enable";
+     static final String QTI_SOFTWARE_FENCE =
+             "vendor.qti-ext-output-sw-fence-enable.value";
+     static final String QTI_OUTPUT_FENCE_ENABLE = "vendor.qti-ext-output-fence.enable";
+     static final String QTI_OUTPUT_FENCE_TYPE = "vendor.qti-ext-output-fence.fence_type";
+ 
++    static final String MTK_LOW_LATENCY_MODE = "vendor.mtk.vdec.low-latency.mode";
++    static final String MTK_DISABLE_IDLE = "vendor.mtk.vdec.disable-idle";
++    static final String MTK_VSYNC_ADJUST_ENABLE = "vendor.mtk.vdec.vsync.adjust.enable";
++    static final String MTK_ULTRA_LOW_LATENCY = "vendor.mtk.vdec.ultra-low-latency";
++    static final String MTK_PRELOAD_FRAME_COUNT = "vendor.mtk.vdec.preload.frame.count";
++    static final String MTK_INPUT_QUEUE_DEPTH = "vendor.mtk.vdec.input.max.queue.depth";
++    static final String MTK_OUTPUT_QUEUE_DEPTH = "vendor.mtk.vdec.output.max.queue.depth";
++    static final String MTK_FETCH_TIMEOUT = "vendor.mtk.vdec.buffer.fetch.timeout.ms";
++    static final String MTK_FETCH_TIMEOUT_VALUE = MTK_FETCH_TIMEOUT + ".value";
++    static final String MTK_GUARD_INTERVAL = "vendor.mtk.vdec.bq.guard.interval.time";
++    static final String MTK_GUARD_INTERVAL_VALUE = MTK_GUARD_INTERVAL + ".value";
++    static final String MTK_CPU_BOOST = "vendor.mtk.vdec.cpu.boost.mode";
++    static final String MTK_CPU_BOOST_VALUE = MTK_CPU_BOOST + ".value";
++    static final String MTK_DVFS_MODE = "vendor.mtk.vdec.dvfs.mode";
++    static final String MTK_DVFS_LEVEL = "vendor.mtk.vdec.dvfs.level";
++
+     enum DecoderFamily {
+         QUALCOMM,
+         MEDIATEK,
+         OTHER
+     }
+ 
+     enum PlanPurpose {
+         INITIAL_CONFIGURATION,
+         RUNTIME_RECOVERY
+     }
+@@ -119,25 +135,61 @@ final class LowLatencyProfilePlanner {
+         if (purpose == PlanPurpose.RUNTIME_RECOVERY) {
+             List<Profile> recoveryProfiles = new ArrayList<>();
+             addProfile(recoveryProfiles, "android-standard", standardOptions(capabilities));
+             return deduplicateProfiles(recoveryProfiles);
+         }
+ 
+         if (capabilities.family == DecoderFamily.QUALCOMM) {
+             return planQualcomm(capabilities, ultraLowLatency);
+         }
+ 
++        if (capabilities.family == DecoderFamily.MEDIATEK) {
++            return planMediaTek(capabilities, ultraLowLatency);
++        }
++
++        if (capabilities.legacyVdecLowLatencyAllowed) {
++            return planGenericLegacy(capabilities);
++        }
++
+         List<Profile> profiles = new ArrayList<>();
+         addProfile(profiles, "android-standard", standardOptions(capabilities));
+         return deduplicateProfiles(profiles);
+     }
+ 
++    static DecoderFamily classifyDecoderFamily(String decoderName) {
++        String normalizedName = Objects.requireNonNull(decoderName).toLowerCase(Locale.US);
++        if (startsWithAny(normalizedName, "omx.qcom", "omx.qti", "c2.qti", "c2.qcom")) {
++            return DecoderFamily.QUALCOMM;
++        }
++        if (startsWithAny(normalizedName, "omx.mtk", "c2.mtk")) {
++            return DecoderFamily.MEDIATEK;
++        }
++        return DecoderFamily.OTHER;
++    }
++
++    static boolean isLegacyVdecLowLatencyAllowed(String decoderName,
++                                                  String manufacturer,
++                                                  int sdkInt) {
++        DecoderFamily family = classifyDecoderFamily(decoderName);
++        if (family == DecoderFamily.QUALCOMM) {
++            return false;
++        }
++        if ("xiaomi".equalsIgnoreCase(manufacturer) && sdkInt <= 23) {
++            return false;
++        }
++
++        String normalizedName = decoderName.toLowerCase(Locale.US);
++        return family == DecoderFamily.MEDIATEK ||
++                startsWithAny(normalizedName, "omx.amlogic", "c2.amlogic") ||
++                "amazon".equalsIgnoreCase(manufacturer);
++    }
++
+     static List<Profile> deduplicateProfiles(List<Profile> profiles) {
+         LinkedHashSet<Profile> uniqueProfiles = new LinkedHashSet<>(profiles);
+         return Collections.unmodifiableList(new ArrayList<>(uniqueProfiles));
+     }
+ 
+     private static List<Profile> planQualcomm(Capabilities capabilities,
+                                                boolean ultraLowLatency) {
+         boolean legacyQualcomm = capabilities.sdkInt >= 26 && capabilities.sdkInt < 31;
+         boolean qtiCore = legacyQualcomm || supportsVendorParameter(capabilities, QTI_CORE);
+         boolean pictureOrder = legacyQualcomm ||
+@@ -176,20 +228,66 @@ final class LowLatencyProfilePlanner {
+ 
+         addProfile(profiles, "qti-no-fence",
+                 qtiBaseOptions(capabilities, qtiCore, pictureOrder));
+         addProfile(profiles, "android-standard", standardOptions(capabilities));
+         addQtiCorePictureProfile(profiles, capabilities, qtiCore, pictureOrder);
+         addQtiCoreOnlyProfile(profiles, qtiCore);
+ 
+         return deduplicateProfiles(profiles);
+     }
+ 
++    private static List<Profile> planMediaTek(Capabilities capabilities,
++                                               boolean ultraLowLatency) {
++        LinkedHashMap<String, Integer> standard = standardOptions(capabilities);
++        LinkedHashMap<String, Integer> legacy = legacyOptions(capabilities);
++        List<Profile> profiles = new ArrayList<>();
++
++        if (!ultraLowLatency) {
++            addProfile(profiles, "android-standard", standard);
++            addProfile(profiles, "mtk-legacy", legacy);
++            return deduplicateProfiles(profiles);
++        }
++
++        LinkedHashMap<String, Integer> scheduler = schedulerOptions(capabilities);
++        LinkedHashMap<String, Integer> experimental = combinedOptions(standard, legacy);
++        int nonVendorOptionCount = experimental.size();
++        addMediaTekVendorOptions(experimental, capabilities);
++        if (experimental.size() > nonVendorOptionCount) {
++            experimental.putAll(scheduler);
++            addProfile(profiles, "mtk-experimental-full", experimental);
++        }
++
++        if (!standard.isEmpty() && !legacy.isEmpty() && !scheduler.isEmpty()) {
++            addProfile(profiles, "mtk-standard-legacy-performance",
++                    combinedOptions(standard, legacy, scheduler));
++        }
++        if (!standard.isEmpty() && !scheduler.isEmpty()) {
++            addProfile(profiles, "mtk-standard-performance",
++                    combinedOptions(standard, scheduler));
++        }
++        addProfile(profiles, "android-standard", standard);
++        if (!legacy.isEmpty() && !scheduler.isEmpty()) {
++            addProfile(profiles, "mtk-legacy-performance",
++                    combinedOptions(legacy, scheduler));
++        }
++        addProfile(profiles, "mtk-legacy", legacy);
++        addProfile(profiles, "performance-only", scheduler);
++        return deduplicateProfiles(profiles);
++    }
++
++    private static List<Profile> planGenericLegacy(Capabilities capabilities) {
++        List<Profile> profiles = new ArrayList<>();
++        addProfile(profiles, "android-standard", standardOptions(capabilities));
++        addProfile(profiles, "legacy-vdec", legacyOptions(capabilities));
++        return deduplicateProfiles(profiles);
++    }
++
+     private static LinkedHashMap<String, Integer> qtiBaseOptions(
+             Capabilities capabilities,
+             boolean qtiCore,
+             boolean pictureOrder) {
+         LinkedHashMap<String, Integer> options = standardOptions(capabilities);
+         if (qtiCore) {
+             options.put(QTI_CORE, 1);
+         }
+         if (pictureOrder) {
+             options.put(QTI_PICTURE_ORDER,
+@@ -224,20 +322,86 @@ final class LowLatencyProfilePlanner {
+     }
+ 
+     private static LinkedHashMap<String, Integer> standardOptions(Capabilities capabilities) {
+         LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
+         if (capabilities.androidLowLatencySupported) {
+             options.put(MediaFormat.KEY_LOW_LATENCY, 1);
+         }
+         return options;
+     }
+ 
++    private static LinkedHashMap<String, Integer> legacyOptions(Capabilities capabilities) {
++        LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
++        if (capabilities.legacyVdecLowLatencyAllowed) {
++            options.put(VDEC_LOW_LATENCY, 1);
++        }
++        return options;
++    }
++
++    @SafeVarargs
++    private static LinkedHashMap<String, Integer> combinedOptions(
++            Map<String, Integer>... optionSets) {
++        LinkedHashMap<String, Integer> combined = new LinkedHashMap<>();
++        for (Map<String, Integer> optionSet : optionSets) {
++            combined.putAll(optionSet);
++        }
++        return combined;
++    }
++
++    private static LinkedHashMap<String, Integer> schedulerOptions(
++            Capabilities capabilities) {
++        LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
++        addScheduler(options, capabilities);
++        return options;
++    }
++
++    private static void addMediaTekVendorOptions(LinkedHashMap<String, Integer> options,
++                                                  Capabilities capabilities) {
++        addAdvertisedOption(options, capabilities, MTK_LOW_LATENCY_MODE, 1);
++        addAdvertisedOption(options, capabilities, MTK_DISABLE_IDLE, 1);
++        addAdvertisedOption(options, capabilities, MTK_VSYNC_ADJUST_ENABLE, 0);
++        addAdvertisedOption(options, capabilities, MTK_ULTRA_LOW_LATENCY, 1);
++        addAdvertisedOption(options, capabilities, MTK_PRELOAD_FRAME_COUNT, 0);
++        addAdvertisedOption(options, capabilities, MTK_INPUT_QUEUE_DEPTH, 2);
++        addAdvertisedOption(options, capabilities, MTK_OUTPUT_QUEUE_DEPTH, 2);
++        addAdvertisedAlias(options, capabilities,
++                MTK_FETCH_TIMEOUT, MTK_FETCH_TIMEOUT_VALUE, 2);
++        addAdvertisedAlias(options, capabilities,
++                MTK_GUARD_INTERVAL, MTK_GUARD_INTERVAL_VALUE, 2);
++        addAdvertisedAlias(options, capabilities,
++                MTK_CPU_BOOST, MTK_CPU_BOOST_VALUE, 1);
++        addAdvertisedOption(options, capabilities, MTK_DVFS_MODE, 1);
++        addAdvertisedOption(options, capabilities, MTK_DVFS_LEVEL, 1);
++    }
++
++    private static void addAdvertisedOption(LinkedHashMap<String, Integer> options,
++                                             Capabilities capabilities,
++                                             String key,
++                                             int value) {
++        if (supportsVendorParameter(capabilities, key)) {
++            options.put(key, value);
++        }
++    }
++
++    private static void addAdvertisedAlias(LinkedHashMap<String, Integer> options,
++                                            Capabilities capabilities,
++                                            String primary,
++                                            String alternate,
++                                            int value) {
++        if (supportsVendorParameter(capabilities, alternate)) {
++            options.put(alternate, value);
++        }
++        else if (supportsVendorParameter(capabilities, primary)) {
++            options.put(primary, value);
++        }
++    }
++
+     private static void addPreferredFence(LinkedHashMap<String, Integer> options,
+                                           boolean outputFence,
+                                           boolean softwareFence) {
+         if (outputFence) {
+             options.put(QTI_OUTPUT_FENCE_ENABLE, 1);
+             options.put(QTI_OUTPUT_FENCE_TYPE, 1);
+         }
+         else if (softwareFence) {
+             options.put(QTI_SOFTWARE_FENCE, 1);
+         }
+@@ -252,20 +416,29 @@ final class LowLatencyProfilePlanner {
+             options.put(MediaFormat.KEY_PRIORITY, 0);
+         }
+     }
+ 
+     private static boolean supportsVendorParameter(Capabilities capabilities, String parameter) {
+         return capabilities.sdkInt >= 31 &&
+                 capabilities.vendorParameterEnumerationAvailable &&
+                 capabilities.supportedVendorParameters.contains(parameter.toLowerCase(Locale.US));
+     }
+ 
++    private static boolean startsWithAny(String value, String... prefixes) {
++        for (String prefix : prefixes) {
++            if (value.startsWith(prefix)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
+     private static void addProfile(List<Profile> profiles,
+                                    String name,
+                                    LinkedHashMap<String, Integer> options) {
+         if (!options.isEmpty()) {
+             profiles.add(new Profile(name, options));
+         }
+     }
+ 
+     private LowLatencyProfilePlanner() {
+     }
+diff --git a/app/src/main/java/com/limelight/binding/video/MediaCodecHelper.java b/app/src/main/java/com/limelight/binding/video/MediaCodecHelper.java
+index f85df3b6..b80e99db 100755
+--- a/app/src/main/java/com/limelight/binding/video/MediaCodecHelper.java
++++ b/app/src/main/java/com/limelight/binding/video/MediaCodecHelper.java
+@@ -616,36 +616,45 @@ public class MediaCodecHelper {
+         // NB: Even on Android 10, this optimization still provides significant
+         // performance gains on Pixel 2.
+         return Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                 (
+                         isDecoderInList(qualcommDecoderPrefixes, decoderName)
+                                 || isDecoderInList(refFrameInvalidationHevcPrefixes, decoderName) ||
+                                 isDecoderInList(refFrameInvalidationAvcPrefixes,  decoderName)
+                 ) && !isAdreno620;
+     }
+ 
+-    public static boolean setDecoderLowLatencyOptions(MediaFormat videoFormat, MediaCodecInfo decoderInfo, boolean ultraLowLatency, int tryNumber) {
+-        // Options here should be tried in the order of most to least risky. The decoder will use
+-        // the first MediaFormat that doesn't fail in configure().
+-
+-        if (isDecoderInList(qualcommDecoderPrefixes, decoderInfo.getName())) {
+-            return setDecoderLowLatencyOptions(
+-                    videoFormat,
+-                    decoderInfo,
++    public static boolean setDecoderLowLatencyOptions(MediaFormat videoFormat, MediaCodecInfo decoderInfo, boolean ultraLowLatency, int tryNumber) {
++        // Options here should be tried in the order of most to least risky. The decoder will use
++        // the first MediaFormat that doesn't fail in configure().
++
++        String decoderName = decoderInfo.getName();
++        LowLatencyProfilePlanner.DecoderFamily decoderFamily =
++                LowLatencyProfilePlanner.classifyDecoderFamily(decoderName);
++        boolean legacyVdecLowLatencyAllowed =
++                LowLatencyProfilePlanner.isLegacyVdecLowLatencyAllowed(
++                        decoderName, Build.MANUFACTURER, Build.VERSION.SDK_INT);
++        if (decoderFamily == LowLatencyProfilePlanner.DecoderFamily.QUALCOMM ||
++                decoderFamily == LowLatencyProfilePlanner.DecoderFamily.MEDIATEK ||
++                legacyVdecLowLatencyAllowed) {
++            return setDecoderLowLatencyOptions(
++                    videoFormat,
++                    decoderInfo,
+                     ultraLowLatency,
+                     tryNumber,
+                     vendorParameterCapabilities,
+                     Build.VERSION.SDK_INT,
+-                    decoderSupportsAndroidRLowLatency(
+-                            decoderInfo, videoFormat.getString(MediaFormat.KEY_MIME)),
+-                    decoderSupportsMaxOperatingRate(decoderInfo.getName()));
+-        }
++                    decoderSupportsAndroidRLowLatency(
++                            decoderInfo, videoFormat.getString(MediaFormat.KEY_MIME)),
++                    decoderSupportsMaxOperatingRate(decoderName),
++                    Build.MANUFACTURER);
++        }
+ 
+         boolean setNewOption = false;
+ 
+ //derflacco
+         // NVIDIA Tegra extra low-latency toggles
+         if (isNvidiaDecoder(decoderInfo.getName())) {
+             safeSet(videoFormat, "media.low-latency.enable", 1);
+             safeSet(videoFormat, "vendor.low-latency.enable", 1);
+             safeSet(videoFormat, "disable-output-reorder", 1);
+             safeSet(videoFormat, "vendor.nvidia.disable-output-reorder", 1);
+@@ -658,40 +667,21 @@ public class MediaCodecHelper {
+ 
+             // If this decoder officially supports FEATURE_LowLatency, we will just use that alone
+             // for try 0. Otherwise, we'll include it as best effort with other options.
+             if (!ultraLowLatency && decoderSupportsAndroidRLowLatency(decoderInfo, videoFormat.getString(MediaFormat.KEY_MIME))) {
+                 return true;
+             }
+ 
+             // ALONSOJR1980: "low-latency" is not enough, continuing to add specific extensions
+         }
+ 
+-        if (tryNumber < 2 &&
+-                (!Build.MANUFACTURER.equalsIgnoreCase("xiaomi") || Build.VERSION.SDK_INT > Build.VERSION_CODES.M)) {
+-            // MediaTek decoders don't use vendor-defined keys for low latency mode. Instead, they have a modified
+-            // version of AOSP's ACodec.cpp which supports the "vdec-lowlatency" option. This option is passed down
+-            // to the decoder as OMX.MTK.index.param.video.LowLatencyDecode.
+-            //
+-            // This option is also plumbed for Amazon Amlogic-based devices like the Fire TV 3. Not only does it
+-            // reduce latency on Amlogic, it fixes the HEVC bug that causes the decoder to not output any frames.
+-            // Unfortunately, it does the exact opposite for the Xiaomi MITV4-ANSM0, breaking it in the way that
+-            // Fire TV was broken prior to vdec-lowlatency :(
+-            //
+-            // On Fire TV 3, vdec-lowlatency is translated to OMX.amazon.fireos.index.video.lowLatencyDecode.
+-            //
+-            // https://github.com/yuan1617/Framwork/blob/master/frameworks/av/media/libstagefright/ACodec.cpp
+-            // https://github.com/iykex/vendor_mediatek_proprietary_hardware/blob/master/libomx/video/MtkOmxVdecEx/MtkOmxVdecEx.h
+-            videoFormat.setInteger("vdec-lowlatency", 1);
+-            setNewOption = true;
+-        }
+-
+-        if (tryNumber < 3) {
++        if (tryNumber < 3) {
+             if (MediaCodecHelper.decoderSupportsMaxOperatingRate(decoderInfo.getName())) {
+                 videoFormat.setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE);
+                 setNewOption = true;
+             }
+             else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                 videoFormat.setInteger(MediaFormat.KEY_PRIORITY, 0);
+                 setNewOption = true;
+             }
+         }
+ 
+@@ -699,67 +689,21 @@ public class MediaCodecHelper {
+         // These allow access to functionality that is not exposed through documented MediaFormat.KEY_* values.
+         // https://cs.android.com/android/platform/superproject/+/master:hardware/qcom/sdm845/media/mm-video-v4l2/vidc/common/inc/vidc_vendor_extensions.h;l=67
+         //
+         // MediaCodec vendor extension support was introduced in Android 8.0:
+         // https://cs.android.com/android/_/android/platform/frameworks/av/+/01c10f8cdcd58d1e7025f426a72e6e75ba5d7fc2
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+             // Try vendor-specific low latency options
+             //
+             // NOTE: Update knownVendorLowLatencyOptions if you modify this code!
+             // ALONSOJR1980
+-//            else if (isDecoderInList(mtkDecoderPrefixes, decoderInfo.getName())) {
+-//                if (tryNumber < 4) {
+-//
+-//                    videoFormat.setInteger("vendor.mtk.vdec.cpu.boost.mode.value", 2);
+-//                    videoFormat.setInteger("vendor.mtk.ext.dolby.vision.cpu-boost", 1);
+-//                    videoFormat.setInteger("vendor.mtk.vdec.bq.guard.interval.time.value", 2);
+-//                    videoFormat.setInteger("vendor.mtk.vdec.buffer.fetch.timeout.ms.value", 2);
+-            if (isDecoderInList(mtkDecoderPrefixes, decoderInfo.getName())) {
+-                if (tryNumber < 4) {
+-                    // --- PRESET: MTK Low-Latency (safe & balanced, no duplicates) ---
+-
+-                    // Boost/DVFS: moderate profile
+-                    safeSet(videoFormat, "vdec-lowlatency", 1);
+-                    safeSet(videoFormat, "vendor.mtk.vdec.cpu.boost.mode", 1);
+-                    safeSet(videoFormat, "vendor.mtk.vdec.cpu.boost.mode.value", 1);
+-                    safeSet(videoFormat, "vendor.mtk.vdec.dvfs.mode", 1);
+-                    safeSet(videoFormat, "vendor.mtk.vdec.dvfs.level", 1);
+-
+-                    // Pipeline / code path
+-                    safeSet(videoFormat, "vendor.mtk.vdec.low-latency.mode", 1);    // Enable low-latency path
+-                    safeSet(videoFormat, "vendor.mtk.vdec.ultra-low-latency", 0);   // ULL off for stability
+-                    safeSet(videoFormat, "vendor.mtk.vdec.disable-idle", 1);        // Prevent clock downscaling
+-                    safeSet(videoFormat, "vendor.mtk.vdec.preload.frame.count", 1); // Light prebuffering
+-
+-                    // Queue / timeouts (moderate)
+-                    safeSet(videoFormat, "vendor.mtk.vdec.buffer.fetch.timeout.ms", 4);
+-                    safeSet(videoFormat, "vendor.mtk.vdec.bq.guard.interval.time", 4);
+-                    safeSet(videoFormat, "vendor.mtk.vdec.input.max.queue.depth", 3);
+-                    safeSet(videoFormat, "vendor.mtk.vdec.output.max.queue.depth", 3);
+-
+-                    // Pacing: controlled by the app
+-                    safeSet(videoFormat, "vendor.mtk.vdec.vsync.adjust.enable", 0);
+-
+-                    // Skip/drop: only NVOP
+-                    safeSet(videoFormat, "vendor.mtk.vdec.nvop.skip", 1);
+-                    safeSet(videoFormat, "vendor.mtk.vdec.skip.mode", 0);
+-                    safeSet(videoFormat, "vendor.mtk.vdec.drop.nonref.frame", 0);
+-                    safeSet(videoFormat, "vendor.mtk.vdec.frame-drop.policy", 0);
+-
+-                    // Standard Android hints
+-                    safeSet(videoFormat, MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE);
+-                    safeSet(videoFormat, MediaFormat.KEY_PRIORITY, 0);
+-                }
+-                setNewOption = true;
+-            }
+-
+-            else if (isDecoderInList(kirinDecoderPrefixes, decoderInfo.getName())) {
++            if (isDecoderInList(kirinDecoderPrefixes, decoderInfo.getName())) {
+                 if (tryNumber < 4) {
+                     // Kirin low latency options
+                     // https://developer.huawei.com/consumer/cn/forum/topic/0202325564295980115
+                     videoFormat.setInteger("vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-req", 1);
+                     videoFormat.setInteger("vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-rdy", -1);
+                     setNewOption = true;
+                 }
+             }
+             else if (isDecoderInList(exynosDecoderPrefixes, decoderInfo.getName())) {
+                 if (tryNumber < 4) {
+@@ -774,44 +718,79 @@ public class MediaCodecHelper {
+                     // https://github.com/codewalkerster/android_vendor_amlogic_common_prebuilt_libstagefrighthw/commit/41fefc4e035c476d58491324a5fe7666bfc2989e
+                     videoFormat.setInteger("vendor.low-latency.enable", 1);
+                     setNewOption = true;
+                 }
+             }
+         }
+ 
+         return setNewOption;
+     }
+ 
+-    static boolean setDecoderLowLatencyOptions(
++    static boolean setDecoderLowLatencyOptions(
+             MediaFormat videoFormat,
+             MediaCodecInfo decoderInfo,
+             boolean ultraLowLatency,
+             int tryNumber,
+             VendorParameterCapabilityStore capabilityStore,
+-            int sdkInt,
+-            boolean androidLowLatencySupported,
+-            boolean maxOperatingRateSupported) {
+-        if (!isDecoderInList(qualcommDecoderPrefixes, decoderInfo.getName()) || tryNumber < 0) {
+-            return false;
+-        }
+-
+-        VendorParameterSnapshot snapshot = capabilityStore.getSnapshot(
+-                decoderInfo.getName(), sdkInt);
+-        LowLatencyProfilePlanner.Capabilities capabilities =
+-                new LowLatencyProfilePlanner.Capabilities(
+-                        LowLatencyProfilePlanner.DecoderFamily.QUALCOMM,
+-                        decoderInfo.getName(),
+-                        sdkInt,
+-                        androidLowLatencySupported,
+-                        maxOperatingRateSupported,
+-                        false,
+-                        snapshot.enumerationAvailable,
++            int sdkInt,
++            boolean androidLowLatencySupported,
++            boolean maxOperatingRateSupported) {
++        return setDecoderLowLatencyOptions(
++                videoFormat,
++                decoderInfo,
++                ultraLowLatency,
++                tryNumber,
++                capabilityStore,
++                sdkInt,
++                androidLowLatencySupported,
++                maxOperatingRateSupported,
++                Build.MANUFACTURER);
++    }
++
++    static boolean setDecoderLowLatencyOptions(
++            MediaFormat videoFormat,
++            MediaCodecInfo decoderInfo,
++            boolean ultraLowLatency,
++            int tryNumber,
++            VendorParameterCapabilityStore capabilityStore,
++            int sdkInt,
++            boolean androidLowLatencySupported,
++            boolean maxOperatingRateSupported,
++            String manufacturer) {
++        if (tryNumber < 0) {
++            return false;
++        }
++
++        String decoderName = decoderInfo.getName();
++        LowLatencyProfilePlanner.DecoderFamily decoderFamily =
++                LowLatencyProfilePlanner.classifyDecoderFamily(decoderName);
++        boolean legacyVdecLowLatencyAllowed =
++                LowLatencyProfilePlanner.isLegacyVdecLowLatencyAllowed(
++                        decoderName, manufacturer, sdkInt);
++        if (decoderFamily == LowLatencyProfilePlanner.DecoderFamily.OTHER &&
++                !legacyVdecLowLatencyAllowed) {
++            return false;
++        }
++
++        VendorParameterSnapshot snapshot =
++                decoderFamily == LowLatencyProfilePlanner.DecoderFamily.OTHER ?
++                        VendorParameterSnapshot.unavailable() :
++                        capabilityStore.getSnapshot(decoderName, sdkInt);
++        LowLatencyProfilePlanner.Capabilities capabilities =
++                new LowLatencyProfilePlanner.Capabilities(
++                        decoderFamily,
++                        decoderName,
++                        sdkInt,
++                        androidLowLatencySupported,
++                        maxOperatingRateSupported,
++                        legacyVdecLowLatencyAllowed,
++                        snapshot.enumerationAvailable,
+                         snapshot.supportedParameters);
+         List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
+                 capabilities,
+                 ultraLowLatency,
+                 LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
+ 
+         if (tryNumber >= profiles.size()) {
+             return false;
+         }
+ 
+diff --git a/app/src/test/java/com/limelight/binding/video/LowLatencyProfilePlannerTest.java b/app/src/test/java/com/limelight/binding/video/LowLatencyProfilePlannerTest.java
+index c67f8907..75d71393 100644
+--- a/app/src/test/java/com/limelight/binding/video/LowLatencyProfilePlannerTest.java
++++ b/app/src/test/java/com/limelight/binding/video/LowLatencyProfilePlannerTest.java
+@@ -12,20 +12,52 @@ import org.junit.Test;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.LinkedHashMap;
+ import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+ 
+ public class LowLatencyProfilePlannerTest {
++    private static final String MTK_LOW_LATENCY_MODE =
++            "vendor.mtk.vdec.low-latency.mode";
++    private static final String MTK_DISABLE_IDLE = "vendor.mtk.vdec.disable-idle";
++    private static final String MTK_VSYNC_ADJUST =
++            "vendor.mtk.vdec.vsync.adjust.enable";
++    private static final String MTK_ULTRA_LOW_LATENCY =
++            "vendor.mtk.vdec.ultra-low-latency";
++    private static final String MTK_PRELOAD_FRAME_COUNT =
++            "vendor.mtk.vdec.preload.frame.count";
++    private static final String MTK_INPUT_QUEUE_DEPTH =
++            "vendor.mtk.vdec.input.max.queue.depth";
++    private static final String MTK_OUTPUT_QUEUE_DEPTH =
++            "vendor.mtk.vdec.output.max.queue.depth";
++    private static final String MTK_FETCH_TIMEOUT =
++            "vendor.mtk.vdec.buffer.fetch.timeout.ms";
++    private static final String MTK_FETCH_TIMEOUT_VALUE = MTK_FETCH_TIMEOUT + ".value";
++    private static final String MTK_GUARD_INTERVAL =
++            "vendor.mtk.vdec.bq.guard.interval.time";
++    private static final String MTK_GUARD_INTERVAL_VALUE = MTK_GUARD_INTERVAL + ".value";
++    private static final String MTK_CPU_BOOST = "vendor.mtk.vdec.cpu.boost.mode";
++    private static final String MTK_CPU_BOOST_VALUE = MTK_CPU_BOOST + ".value";
++    private static final String MTK_DVFS_MODE = "vendor.mtk.vdec.dvfs.mode";
++    private static final String MTK_DVFS_LEVEL = "vendor.mtk.vdec.dvfs.level";
++
++    private static final List<String> FORBIDDEN_MTK_KEYS = Arrays.asList(
++            "media.low-latency.enable",
++            "vendor.low-latency.enable",
++            "vendor.mtk.vdec.nvop.skip",
++            "vendor.mtk.vdec.skip.mode",
++            "vendor.mtk.vdec.drop.nonref.frame",
++            "vendor.mtk.vdec.frame-drop.policy");
++
+     private static final Set<String> S25_VENDOR_PARAMETERS = parameters(
+             LowLatencyProfilePlanner.QTI_PICTURE_ORDER,
+             LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE,
+             LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_TYPE);
+ 
+     @Test
+     public void profileOptionsAreOrderedAndImmutable() {
+         LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
+         options.put("low-latency", 1);
+         options.put("vendor.test.option", 2);
+@@ -317,38 +349,429 @@ public class LowLatencyProfilePlannerTest {
+     public void plannerNeverReturnsEmptyBaseProfile() {
+         List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
+                 capabilities("c2.qti.avc.decoder", 36, false, false,
+                         true, Collections.emptySet()),
+                 false,
+                 LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
+ 
+         assertTrue(profiles.isEmpty());
+     }
+ 
++    @Test
++    public void decoderFamilyClassificationIsCaseInsensitiveAndIndependentOfInitialization() {
++        assertEquals(LowLatencyProfilePlanner.DecoderFamily.MEDIATEK,
++                LowLatencyProfilePlanner.classifyDecoderFamily("C2.MTK.AVC.Decoder"));
++        assertEquals(LowLatencyProfilePlanner.DecoderFamily.MEDIATEK,
++                LowLatencyProfilePlanner.classifyDecoderFamily("omx.mTk.video.decoder.hevc"));
++        assertEquals(LowLatencyProfilePlanner.DecoderFamily.QUALCOMM,
++                LowLatencyProfilePlanner.classifyDecoderFamily("C2.QTI.AVC.Decoder"));
++        assertEquals(LowLatencyProfilePlanner.DecoderFamily.QUALCOMM,
++                LowLatencyProfilePlanner.classifyDecoderFamily("omx.QCOM.video.decoder.avc"));
++        assertEquals(LowLatencyProfilePlanner.DecoderFamily.QUALCOMM,
++                LowLatencyProfilePlanner.classifyDecoderFamily("C2.QCOM.HEVC.Decoder"));
++        assertEquals(LowLatencyProfilePlanner.DecoderFamily.QUALCOMM,
++                LowLatencyProfilePlanner.classifyDecoderFamily("OMX.QTI.video.decoder.avc"));
++        assertEquals(LowLatencyProfilePlanner.DecoderFamily.OTHER,
++                LowLatencyProfilePlanner.classifyDecoderFamily("c2.exynos.avc.decoder"));
++    }
++
++    @Test
++    public void legacyVdecEligibilityIsScopedAndNeverIncludesQualcomm() {
++        assertTrue(LowLatencyProfilePlanner.isLegacyVdecLowLatencyAllowed(
++                "c2.mtk.avc.decoder", "Samsung", 33));
++        assertTrue(LowLatencyProfilePlanner.isLegacyVdecLowLatencyAllowed(
++                "OMX.AMLOGIC.video.decoder.avc", "Google", 30));
++        assertTrue(LowLatencyProfilePlanner.isLegacyVdecLowLatencyAllowed(
++                "c2.exynos.avc.decoder", "aMaZoN", 33));
++
++        assertFalse(LowLatencyProfilePlanner.isLegacyVdecLowLatencyAllowed(
++                "c2.qti.avc.decoder", "Amazon", 33));
++        assertFalse(LowLatencyProfilePlanner.isLegacyVdecLowLatencyAllowed(
++                "OMX.QTI.video.decoder.avc", "Amazon", 33));
++        assertFalse(LowLatencyProfilePlanner.isLegacyVdecLowLatencyAllowed(
++                "c2.mtk.avc.decoder", "Xiaomi", 23));
++        assertTrue(LowLatencyProfilePlanner.isLegacyVdecLowLatencyAllowed(
++                "c2.mtk.avc.decoder", "Xiaomi", 24));
++        assertFalse(LowLatencyProfilePlanner.isLegacyVdecLowLatencyAllowed(
++                "c2.exynos.avc.decoder", "Samsung", 33));
++    }
++
++    @Test
++    public void mediatekUllOffUsesOnlyStandardThenLegacy() {
++        List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                capabilities(LowLatencyProfilePlanner.DecoderFamily.MEDIATEK,
++                        "c2.mtk.avc.decoder", 33, true, true, true, true,
++                        parameters(MTK_LOW_LATENCY_MODE, MTK_ULTRA_LOW_LATENCY)),
++                false,
++                LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++
++        assertEquals(Arrays.asList("android-standard", "mtk-legacy"), profileNames(profiles));
++        assertEquals(options(MediaFormat.KEY_LOW_LATENCY, 1),
++                profiles.get(0).integerOptions);
++        assertEquals(options(LowLatencyProfilePlanner.VDEC_LOW_LATENCY, 1),
++                profiles.get(1).integerOptions);
++        assertNoMtkVendorOrSchedulerOptions(profiles);
++    }
++
++    @Test
++    public void mediatekFullAdvertisedPlanHasExactRiskOrderAndKeyMaps() {
++        Set<String> advertised = parameters(
++                MTK_LOW_LATENCY_MODE,
++                MTK_DISABLE_IDLE,
++                MTK_VSYNC_ADJUST,
++                MTK_ULTRA_LOW_LATENCY,
++                MTK_PRELOAD_FRAME_COUNT,
++                MTK_INPUT_QUEUE_DEPTH,
++                MTK_OUTPUT_QUEUE_DEPTH,
++                MTK_FETCH_TIMEOUT,
++                MTK_FETCH_TIMEOUT_VALUE,
++                MTK_GUARD_INTERVAL,
++                MTK_GUARD_INTERVAL_VALUE,
++                MTK_CPU_BOOST,
++                MTK_CPU_BOOST_VALUE,
++                MTK_DVFS_MODE,
++                MTK_DVFS_LEVEL);
++
++        List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                capabilities(LowLatencyProfilePlanner.DecoderFamily.MEDIATEK,
++                        "c2.mtk.hevc.decoder", 33, true, true, true, true, advertised),
++                true,
++                LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++
++        assertEquals(Arrays.asList(
++                        "mtk-experimental-full",
++                        "mtk-standard-legacy-performance",
++                        "mtk-standard-performance",
++                        "android-standard",
++                        "mtk-legacy-performance",
++                        "mtk-legacy",
++                        "performance-only"),
++                profileNames(profiles));
++        assertEquals(options(
++                        MediaFormat.KEY_LOW_LATENCY, 1,
++                        LowLatencyProfilePlanner.VDEC_LOW_LATENCY, 1,
++                        MTK_LOW_LATENCY_MODE, 1,
++                        MTK_DISABLE_IDLE, 1,
++                        MTK_VSYNC_ADJUST, 0,
++                        MTK_ULTRA_LOW_LATENCY, 1,
++                        MTK_PRELOAD_FRAME_COUNT, 0,
++                        MTK_INPUT_QUEUE_DEPTH, 2,
++                        MTK_OUTPUT_QUEUE_DEPTH, 2,
++                        MTK_FETCH_TIMEOUT_VALUE, 2,
++                        MTK_GUARD_INTERVAL_VALUE, 2,
++                        MTK_CPU_BOOST_VALUE, 1,
++                        MTK_DVFS_MODE, 1,
++                        MTK_DVFS_LEVEL, 1,
++                        MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE),
++                profiles.get(0).integerOptions);
++        assertEquals(options(
++                        MediaFormat.KEY_LOW_LATENCY, 1,
++                        LowLatencyProfilePlanner.VDEC_LOW_LATENCY, 1,
++                        MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE),
++                profiles.get(1).integerOptions);
++        assertEquals(options(
++                        MediaFormat.KEY_LOW_LATENCY, 1,
++                        MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE),
++                profiles.get(2).integerOptions);
++        assertEquals(options(MediaFormat.KEY_LOW_LATENCY, 1),
++                profiles.get(3).integerOptions);
++        assertEquals(options(
++                        LowLatencyProfilePlanner.VDEC_LOW_LATENCY, 1,
++                        MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE),
++                profiles.get(4).integerOptions);
++        assertEquals(options(LowLatencyProfilePlanner.VDEC_LOW_LATENCY, 1),
++                profiles.get(5).integerOptions);
++        assertEquals(options(MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE),
++                profiles.get(6).integerOptions);
++        assertMtkProfilesAreSafeUniqueAndBounded(profiles);
++    }
++
++    @Test
++    public void mediatekAliasesSelectAvailableKeyAndPreferValueAlias() {
++        List<Set<String>> advertisedFixtures = Arrays.asList(
++                parameters(MTK_FETCH_TIMEOUT, MTK_GUARD_INTERVAL, MTK_CPU_BOOST),
++                parameters(MTK_FETCH_TIMEOUT_VALUE, MTK_GUARD_INTERVAL_VALUE,
++                        MTK_CPU_BOOST_VALUE),
++                parameters(MTK_FETCH_TIMEOUT, MTK_FETCH_TIMEOUT_VALUE,
++                        MTK_GUARD_INTERVAL, MTK_GUARD_INTERVAL_VALUE,
++                        MTK_CPU_BOOST, MTK_CPU_BOOST_VALUE));
++        List<List<String>> expectedAliases = Arrays.asList(
++                Arrays.asList(MTK_FETCH_TIMEOUT, MTK_GUARD_INTERVAL, MTK_CPU_BOOST),
++                Arrays.asList(MTK_FETCH_TIMEOUT_VALUE, MTK_GUARD_INTERVAL_VALUE,
++                        MTK_CPU_BOOST_VALUE),
++                Arrays.asList(MTK_FETCH_TIMEOUT_VALUE, MTK_GUARD_INTERVAL_VALUE,
++                        MTK_CPU_BOOST_VALUE));
++
++        for (int i = 0; i < advertisedFixtures.size(); i++) {
++            List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                    capabilities(LowLatencyProfilePlanner.DecoderFamily.MEDIATEK,
++                            "OMX.MTK.video.decoder.avc", 31, true, true, true, true,
++                            advertisedFixtures.get(i)),
++                    true,
++                    LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++            Map<String, Integer> full = profiles.get(0).integerOptions;
++
++            assertEquals("mtk-experimental-full", profiles.get(0).name);
++            assertEquals(expectedAliases.get(i), advertisedMtkAliases(full));
++            assertEquals(2, full.get(expectedAliases.get(i).get(0)).intValue());
++            assertEquals(2, full.get(expectedAliases.get(i).get(1)).intValue());
++            assertEquals(1, full.get(expectedAliases.get(i).get(2)).intValue());
++        }
++    }
++
++    @Test
++    public void mediatekApi31EmptyOrFailedEnumerationNeverSpeculatesVendorKeys() {
++        for (boolean enumerationAvailable : Arrays.asList(true, false)) {
++            List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                    capabilities(LowLatencyProfilePlanner.DecoderFamily.MEDIATEK,
++                            "c2.mtk.avc.decoder", 31, true, false, true,
++                            enumerationAvailable, Collections.emptySet()),
++                    true,
++                    LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++
++            assertEquals(Arrays.asList(
++                            "mtk-standard-legacy-performance",
++                            "mtk-standard-performance",
++                            "android-standard",
++                            "mtk-legacy-performance",
++                            "mtk-legacy",
++                            "performance-only"),
++                    profileNames(profiles));
++            assertNoMtkVendorOptions(profiles);
++            assertMtkProfilesAreSafeUniqueAndBounded(profiles);
++        }
++    }
++
++    @Test
++    public void mediatekApi26And30UseOnlyStandardLegacyAndScheduler() {
++        for (int sdkInt : Arrays.asList(26, 30)) {
++            List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                    capabilities(LowLatencyProfilePlanner.DecoderFamily.MEDIATEK,
++                            "OMX.MTK.video.decoder.avc", sdkInt, true, true, true, true,
++                            parameters(MTK_LOW_LATENCY_MODE, MTK_ULTRA_LOW_LATENCY)),
++                    true,
++                    LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++
++            assertEquals(Arrays.asList(
++                            "mtk-standard-legacy-performance",
++                            "mtk-standard-performance",
++                            "android-standard",
++                            "mtk-legacy-performance",
++                            "mtk-legacy",
++                            "performance-only"),
++                    profileNames(profiles));
++            assertNoMtkVendorOptions(profiles);
++            assertMtkProfilesAreSafeUniqueAndBounded(profiles);
++        }
++    }
++
++    @Test
++    public void mediatekUllKeyIsOneWhenAdvertisedAndNeverWrittenAsZero() {
++        List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                capabilities(LowLatencyProfilePlanner.DecoderFamily.MEDIATEK,
++                        "c2.mtk.avc.decoder", 33, true, true, true, true,
++                        parameters(MTK_ULTRA_LOW_LATENCY)),
++                true,
++                LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++
++        assertEquals(1, profiles.get(0).integerOptions.get(MTK_ULTRA_LOW_LATENCY).intValue());
++        for (LowLatencyProfilePlanner.Profile profile : profiles) {
++            Integer ullValue = profile.integerOptions.get(MTK_ULTRA_LOW_LATENCY);
++            assertTrue(ullValue == null || ullValue == 1);
++        }
++    }
++
++    @Test
++    public void mediatekProfilesNeverUseGenericOrSkipDropKeysAndSchedulerIsExclusive() {
++        List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                capabilities(LowLatencyProfilePlanner.DecoderFamily.MEDIATEK,
++                        "c2.mtk.avc.decoder", 33, true, false, true, true,
++                        parameters(MTK_LOW_LATENCY_MODE, MTK_ULTRA_LOW_LATENCY)),
++                true,
++                LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++
++        for (LowLatencyProfilePlanner.Profile profile : profiles) {
++            for (String forbiddenKey : FORBIDDEN_MTK_KEYS) {
++                assertFalse(profile.integerOptions.containsKey(forbiddenKey));
++            }
++            assertFalse(profile.integerOptions.containsKey(MediaFormat.KEY_OPERATING_RATE) &&
++                    profile.integerOptions.containsKey(MediaFormat.KEY_PRIORITY));
++        }
++        assertEquals(0, profiles.get(0).integerOptions.get(MediaFormat.KEY_PRIORITY).intValue());
++    }
++
++    @Test
++    public void mediatekProfilesStayUniqueNonEmptyAndBoundedAcrossCapabilityCombinations() {
++        Set<String> allVendorOptions = parameters(
++                MTK_LOW_LATENCY_MODE,
++                MTK_DISABLE_IDLE,
++                MTK_VSYNC_ADJUST,
++                MTK_ULTRA_LOW_LATENCY,
++                MTK_PRELOAD_FRAME_COUNT,
++                MTK_INPUT_QUEUE_DEPTH,
++                MTK_OUTPUT_QUEUE_DEPTH,
++                MTK_FETCH_TIMEOUT,
++                MTK_FETCH_TIMEOUT_VALUE,
++                MTK_GUARD_INTERVAL,
++                MTK_GUARD_INTERVAL_VALUE,
++                MTK_CPU_BOOST,
++                MTK_CPU_BOOST_VALUE,
++                MTK_DVFS_MODE,
++                MTK_DVFS_LEVEL);
++
++        for (int sdkInt : Arrays.asList(22, 23, 26, 30, 31, 36)) {
++            for (boolean standard : Arrays.asList(false, true)) {
++                for (boolean maxOperatingRate : Arrays.asList(false, true)) {
++                    for (boolean legacy : Arrays.asList(false, true)) {
++                        for (boolean enumerationAvailable : Arrays.asList(false, true)) {
++                            for (Set<String> advertised : Arrays.asList(
++                                    Collections.<String>emptySet(), allVendorOptions)) {
++                                for (boolean ultraLowLatency : Arrays.asList(false, true)) {
++                                    List<LowLatencyProfilePlanner.Profile> profiles =
++                                            LowLatencyProfilePlanner.plan(
++                                                    capabilities(
++                                                            LowLatencyProfilePlanner.DecoderFamily.MEDIATEK,
++                                                            "c2.mtk.avc.decoder",
++                                                            sdkInt,
++                                                            standard,
++                                                            maxOperatingRate,
++                                                            legacy,
++                                                            enumerationAvailable,
++                                                            advertised),
++                                                    ultraLowLatency,
++                                                    LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++
++                                    assertMtkProfilesAreSafeUniqueAndBounded(profiles);
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    @Test
++    public void genericLegacyOtherUsesStandardThenVdecRegardlessOfUll() {
++        for (boolean ultraLowLatency : Arrays.asList(false, true)) {
++            List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                    capabilities(LowLatencyProfilePlanner.DecoderFamily.OTHER,
++                            "OMX.amlogic.avc.decoder", 33, true, true, true, false,
++                            Collections.emptySet()),
++                    ultraLowLatency,
++                    LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++
++            assertEquals(Arrays.asList("android-standard", "legacy-vdec"),
++                    profileNames(profiles));
++            assertEquals(options(MediaFormat.KEY_LOW_LATENCY, 1),
++                    profiles.get(0).integerOptions);
++            assertEquals(options(LowLatencyProfilePlanner.VDEC_LOW_LATENCY, 1),
++                    profiles.get(1).integerOptions);
++        }
++
++        List<LowLatencyProfilePlanner.Profile> legacyOnly = LowLatencyProfilePlanner.plan(
++                capabilities(LowLatencyProfilePlanner.DecoderFamily.OTHER,
++                        "c2.vendor.decoder", 30, false, true, true, false,
++                        Collections.emptySet()),
++                true,
++                LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++        assertEquals(Collections.singletonList("legacy-vdec"), profileNames(legacyOnly));
++        assertEquals(options(LowLatencyProfilePlanner.VDEC_LOW_LATENCY, 1),
++                legacyOnly.get(0).integerOptions);
++    }
++
+     private static LowLatencyProfilePlanner.Capabilities capabilities(
+             String decoderName,
+             int sdkInt,
+             boolean androidLowLatencySupported,
+             boolean maxOperatingRateSupported,
+             boolean vendorParameterEnumerationAvailable,
+             Set<String> supportedVendorParameters) {
+         return new LowLatencyProfilePlanner.Capabilities(
+                 LowLatencyProfilePlanner.DecoderFamily.QUALCOMM,
+                 decoderName,
+                 sdkInt,
+                 androidLowLatencySupported,
+                 maxOperatingRateSupported,
+                 false,
+                 vendorParameterEnumerationAvailable,
+                 supportedVendorParameters);
+     }
+ 
++    private static LowLatencyProfilePlanner.Capabilities capabilities(
++            LowLatencyProfilePlanner.DecoderFamily family,
++            String decoderName,
++            int sdkInt,
++            boolean androidLowLatencySupported,
++            boolean maxOperatingRateSupported,
++            boolean legacyVdecLowLatencyAllowed,
++            boolean vendorParameterEnumerationAvailable,
++            Set<String> supportedVendorParameters) {
++        return new LowLatencyProfilePlanner.Capabilities(
++                family,
++                decoderName,
++                sdkInt,
++                androidLowLatencySupported,
++                maxOperatingRateSupported,
++                legacyVdecLowLatencyAllowed,
++                vendorParameterEnumerationAvailable,
++                supportedVendorParameters);
++    }
++
++    private static void assertNoMtkVendorOrSchedulerOptions(
++            List<LowLatencyProfilePlanner.Profile> profiles) {
++        assertNoMtkVendorOptions(profiles);
++        for (LowLatencyProfilePlanner.Profile profile : profiles) {
++            assertFalse(profile.integerOptions.containsKey(MediaFormat.KEY_OPERATING_RATE));
++            assertFalse(profile.integerOptions.containsKey(MediaFormat.KEY_PRIORITY));
++        }
++    }
++
++    private static void assertNoMtkVendorOptions(
++            List<LowLatencyProfilePlanner.Profile> profiles) {
++        for (LowLatencyProfilePlanner.Profile profile : profiles) {
++            for (String key : profile.integerOptions.keySet()) {
++                assertFalse(key.startsWith("vendor.mtk."));
++            }
++        }
++    }
++
++    private static void assertMtkProfilesAreSafeUniqueAndBounded(
++            List<LowLatencyProfilePlanner.Profile> profiles) {
++        assertTrue(profiles.size() <= 11);
++        assertEquals(profiles.size(), new LinkedHashSet<>(profiles).size());
++        for (LowLatencyProfilePlanner.Profile profile : profiles) {
++            assertFalse(profile.integerOptions.isEmpty());
++            for (String forbiddenKey : FORBIDDEN_MTK_KEYS) {
++                assertFalse(profile.integerOptions.containsKey(forbiddenKey));
++            }
++            assertFalse(profile.integerOptions.containsKey(MediaFormat.KEY_OPERATING_RATE) &&
++                    profile.integerOptions.containsKey(MediaFormat.KEY_PRIORITY));
++        }
++    }
++
++    private static List<String> advertisedMtkAliases(Map<String, Integer> options) {
++        List<String> aliases = new ArrayList<>();
++        for (String key : Arrays.asList(
++                MTK_FETCH_TIMEOUT,
++                MTK_FETCH_TIMEOUT_VALUE,
++                MTK_GUARD_INTERVAL,
++                MTK_GUARD_INTERVAL_VALUE,
++                MTK_CPU_BOOST,
++                MTK_CPU_BOOST_VALUE)) {
++            if (options.containsKey(key)) {
++                aliases.add(key);
++            }
++        }
++        return aliases;
++    }
++
+     private static int pictureOrderFor(String decoderName) {
+         List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
+                 capabilities(decoderName, 30, false, false,
+                         false, Collections.emptySet()),
+                 false,
+                 LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
+         return profiles.get(0).integerOptions.get(
+                 LowLatencyProfilePlanner.QTI_PICTURE_ORDER);
+     }
+ 
+@@ -374,20 +797,28 @@ public class LowLatencyProfilePlannerTest {
+     private static Set<String> parameters(String... values) {
+         return new LinkedHashSet<>(Arrays.asList(values));
+     }
+ 
+     private static Map<String, Integer> singleOption(String key, int value) {
+         LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
+         options.put(key, value);
+         return options;
+     }
+ 
++    private static Map<String, Integer> options(Object... keyValues) {
++        LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
++        for (int i = 0; i < keyValues.length; i += 2) {
++            options.put((String) keyValues[i], (Integer) keyValues[i + 1]);
++        }
++        return options;
++    }
++
+     private static LowLatencyProfilePlanner.Profile profile(
+             String name,
+             String firstKey,
+             int firstValue,
+             String secondKey,
+             int secondValue) {
+         LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
+         options.put(firstKey, firstValue);
+         options.put(secondKey, secondValue);
+         return new LowLatencyProfilePlanner.Profile(name, options);
+diff --git a/app/src/test/java/com/limelight/binding/video/MediaCodecLowLatencyCapabilityTest.java b/app/src/test/java/com/limelight/binding/video/MediaCodecLowLatencyCapabilityTest.java
+index 5d464f4e..4b1ebe51 100644
+--- a/app/src/test/java/com/limelight/binding/video/MediaCodecLowLatencyCapabilityTest.java
++++ b/app/src/test/java/com/limelight/binding/video/MediaCodecLowLatencyCapabilityTest.java
+@@ -29,28 +29,40 @@ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.CyclicBarrier;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+ @RunWith(RobolectricTestRunner.class)
+ @Config(sdk = {33})
+ public class MediaCodecLowLatencyCapabilityTest {
++    private static final String MTK_LOW_LATENCY_MODE =
++            "vendor.mtk.vdec.low-latency.mode";
++    private static final String MTK_ULTRA_LOW_LATENCY =
++            "vendor.mtk.vdec.ultra-low-latency";
++    private static final String MTK_FETCH_TIMEOUT =
++            "vendor.mtk.vdec.buffer.fetch.timeout.ms";
++    private static final String MTK_FETCH_TIMEOUT_VALUE = MTK_FETCH_TIMEOUT + ".value";
++
+     private static final List<String> LOW_LATENCY_OPTION_KEYS = Arrays.asList(
+             MediaFormat.KEY_LOW_LATENCY,
+             LowLatencyProfilePlanner.VDEC_LOW_LATENCY,
+             LowLatencyProfilePlanner.QTI_CORE,
+             LowLatencyProfilePlanner.QTI_PICTURE_ORDER,
+             LowLatencyProfilePlanner.QTI_SOFTWARE_FENCE,
+             LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE,
+             LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_TYPE,
++            MTK_LOW_LATENCY_MODE,
++            MTK_ULTRA_LOW_LATENCY,
++            MTK_FETCH_TIMEOUT,
++            MTK_FETCH_TIMEOUT_VALUE,
+             MediaFormat.KEY_OPERATING_RATE,
+             MediaFormat.KEY_PRIORITY);
+ 
+     @Before
+     public void initializeCodecHelper() {
+         MediaCodecHelper.initialize(RuntimeEnvironment.getApplication(), "Adreno 740");
+     }
+ 
+     @Test
+     public void advertisedParametersAreNormalizedImmutableCachedAndReleased() {
+@@ -347,20 +359,141 @@ public class MediaCodecLowLatencyCapabilityTest {
+                 true,
+                 0,
+                 store,
+                 33,
+                 true,
+                 true));
+         assertEquals(before, format.toString());
+         assertEquals(0, openCount.get());
+     }
+ 
++    @Test
++    public void mediatekHelperAppliesFreshFiniteProfilesAndTerminates() {
++        AtomicInteger openCount = new AtomicInteger();
++        AtomicInteger releaseCount = new AtomicInteger();
++        MediaCodecHelper.VendorParameterCapabilityStore store =
++                new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
++                    openCount.incrementAndGet();
++                    return session(Arrays.asList(
++                            MTK_LOW_LATENCY_MODE,
++                            MTK_ULTRA_LOW_LATENCY,
++                            MTK_FETCH_TIMEOUT,
++                            MTK_FETCH_TIMEOUT_VALUE), releaseCount);
++                });
++        MediaCodecInfo decoderInfo = mock(MediaCodecInfo.class);
++        when(decoderInfo.getName()).thenReturn("C2.MTK.AVC.Decoder");
++        List<Map<String, Integer>> expectedProfiles = Arrays.asList(
++                options(
++                        MediaFormat.KEY_LOW_LATENCY, 1,
++                        LowLatencyProfilePlanner.VDEC_LOW_LATENCY, 1,
++                        MTK_LOW_LATENCY_MODE, 1,
++                        MTK_ULTRA_LOW_LATENCY, 1,
++                        MTK_FETCH_TIMEOUT_VALUE, 2,
++                        MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE),
++                options(
++                        MediaFormat.KEY_LOW_LATENCY, 1,
++                        LowLatencyProfilePlanner.VDEC_LOW_LATENCY, 1,
++                        MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE),
++                options(
++                        MediaFormat.KEY_LOW_LATENCY, 1,
++                        MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE),
++                options(MediaFormat.KEY_LOW_LATENCY, 1),
++                options(
++                        LowLatencyProfilePlanner.VDEC_LOW_LATENCY, 1,
++                        MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE),
++                options(LowLatencyProfilePlanner.VDEC_LOW_LATENCY, 1),
++                options(MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE));
++
++        for (int tryNumber = 0; tryNumber < expectedProfiles.size(); tryNumber++) {
++            MediaFormat format = videoFormat();
++            assertTrue(MediaCodecHelper.setDecoderLowLatencyOptions(
++                    format,
++                    decoderInfo,
++                    true,
++                    tryNumber,
++                    store,
++                    33,
++                    true,
++                    true,
++                    "Samsung"));
++            assertEquals(expectedProfiles.get(tryNumber).keySet(), optionKeys(format));
++            assertEquals(expectedProfiles.get(tryNumber), lowLatencyOptions(format));
++        }
++
++        MediaFormat exhausted = videoFormat();
++        String exhaustedBefore = exhausted.toString();
++        assertFalse(MediaCodecHelper.setDecoderLowLatencyOptions(
++                exhausted,
++                decoderInfo,
++                true,
++                expectedProfiles.size(),
++                store,
++                33,
++                true,
++                true,
++                "Samsung"));
++        assertEquals(exhaustedBefore, exhausted.toString());
++        assertTrue(lowLatencyOptions(exhausted).isEmpty());
++        assertEquals(1, openCount.get());
++        assertEquals(1, releaseCount.get());
++    }
++
++    @Test
++    public void genericAmlogicLegacyHelperDoesNotProbeVendorParameters() {
++        AtomicInteger openCount = new AtomicInteger();
++        MediaCodecHelper.VendorParameterCapabilityStore store =
++                new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
++                    openCount.incrementAndGet();
++                    throw new AssertionError("Generic legacy path must not enumerate vendor parameters");
++                });
++        MediaCodecInfo decoderInfo = mock(MediaCodecInfo.class);
++        when(decoderInfo.getName()).thenReturn("OMX.AMLOGIC.video.decoder.avc");
++
++        MediaFormat standard = videoFormat();
++        assertTrue(MediaCodecHelper.setDecoderLowLatencyOptions(
++                standard, decoderInfo, true, 0, store, 33, true, true, "Google"));
++        assertEquals(options(MediaFormat.KEY_LOW_LATENCY, 1), lowLatencyOptions(standard));
++
++        MediaFormat legacy = videoFormat();
++        assertTrue(MediaCodecHelper.setDecoderLowLatencyOptions(
++                legacy, decoderInfo, true, 1, store, 33, true, true, "Google"));
++        assertEquals(options(LowLatencyProfilePlanner.VDEC_LOW_LATENCY, 1),
++                lowLatencyOptions(legacy));
++
++        MediaFormat exhausted = videoFormat();
++        assertFalse(MediaCodecHelper.setDecoderLowLatencyOptions(
++                exhausted, decoderInfo, true, 2, store, 33, true, true, "Google"));
++        assertTrue(lowLatencyOptions(exhausted).isEmpty());
++        assertEquals(0, openCount.get());
++    }
++
++    @Test
++    public void nonEligibleExynosAndNvidiaProductionPathsRemainActive() {
++        MediaCodecInfo exynosInfo = mock(MediaCodecInfo.class);
++        when(exynosInfo.getName()).thenReturn("c2.exynos.avc.decoder");
++        MediaFormat exynos = videoFormat();
++        assertTrue(MediaCodecHelper.setDecoderLowLatencyOptions(
++                exynos, exynosInfo, true, 3));
++        assertEquals(1,
++                exynos.getInteger("vendor.rtc-ext-dec-low-latency.enable"));
++
++        MediaCodecInfo nvidiaInfo = mock(MediaCodecInfo.class);
++        when(nvidiaInfo.getName()).thenReturn("c2.nvidia.avc.decoder");
++        MediaFormat nvidia = videoFormat();
++        assertTrue(MediaCodecHelper.setDecoderLowLatencyOptions(
++                nvidia, nvidiaInfo, true, 4));
++        assertEquals(1, nvidia.getInteger("media.low-latency.enable"));
++        assertEquals(1, nvidia.getInteger("vendor.low-latency.enable"));
++        assertEquals(1, nvidia.getInteger("disable-output-reorder"));
++        assertEquals(1, nvidia.getInteger("vendor.nvidia.disable-output-reorder"));
++    }
++
+     private static MediaCodecHelper.VendorParameterCapabilityStore s25Store(
+             AtomicInteger openCount,
+             AtomicInteger releaseCount) {
+         return new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
+             openCount.incrementAndGet();
+             return session(Arrays.asList(
+                     LowLatencyProfilePlanner.QTI_PICTURE_ORDER,
+                     LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE,
+                     LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_TYPE), releaseCount);
+         });

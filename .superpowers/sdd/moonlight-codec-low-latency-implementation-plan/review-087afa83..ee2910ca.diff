@@ -1,0 +1,1455 @@
+# Review package: 087afa8300fdcb5a4131cfadeddd9af04f853391..ee2910ca2a6233fbfe736a162bea47b5a183e54d
+
+## Commits
+ee2910ca Test Qualcomm low-latency helper integration
+a60aa3d7 Gate Qualcomm low-latency profiles by codec capabilities
+
+## Files changed
+ .../binding/video/LowLatencyProfilePlanner.java    | 214 +++++++++++
+ .../limelight/binding/video/MediaCodecHelper.java  | 223 ++++++++---
+ .../video/LowLatencyProfilePlannerTest.java        | 329 ++++++++++++++++
+ .../video/MediaCodecLowLatencyCapabilityTest.java  | 414 +++++++++++++++++++++
+ 4 files changed, 1129 insertions(+), 51 deletions(-)
+
+## Diff
+diff --git a/app/src/main/java/com/limelight/binding/video/LowLatencyProfilePlanner.java b/app/src/main/java/com/limelight/binding/video/LowLatencyProfilePlanner.java
+index 205a18d7..23eabdde 100644
+--- a/app/src/main/java/com/limelight/binding/video/LowLatencyProfilePlanner.java
++++ b/app/src/main/java/com/limelight/binding/video/LowLatencyProfilePlanner.java
+@@ -1,22 +1,84 @@
+ package com.limelight.binding.video;
+ 
++import android.media.MediaFormat;
++
+ import java.util.AbstractMap;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.LinkedHashMap;
+ import java.util.LinkedHashSet;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Map;
+ import java.util.Objects;
++import java.util.Set;
++import java.util.TreeSet;
+ 
+ final class LowLatencyProfilePlanner {
++    static final String VDEC_LOW_LATENCY = "vdec-lowlatency";
++
++    static final String QTI_CORE = "vendor.qti-ext-dec-low-latency.enable";
++    static final String QTI_PICTURE_ORDER = "vendor.qti-ext-dec-picture-order.enable";
++    static final String QTI_SOFTWARE_FENCE =
++            "vendor.qti-ext-output-sw-fence-enable.value";
++    static final String QTI_OUTPUT_FENCE_ENABLE = "vendor.qti-ext-output-fence.enable";
++    static final String QTI_OUTPUT_FENCE_TYPE = "vendor.qti-ext-output-fence.fence_type";
++
++    enum DecoderFamily {
++        QUALCOMM,
++        MEDIATEK,
++        OTHER
++    }
++
++    enum PlanPurpose {
++        INITIAL_CONFIGURATION,
++        RUNTIME_RECOVERY
++    }
++
++    static final class Capabilities {
++        final DecoderFamily family;
++        final String decoderName;
++        final int sdkInt;
++        final boolean androidLowLatencySupported;
++        final boolean maxOperatingRateSupported;
++        final boolean legacyVdecLowLatencyAllowed;
++        final boolean vendorParameterEnumerationAvailable;
++        final Set<String> supportedVendorParameters;
++
++        Capabilities(DecoderFamily family,
++                     String decoderName,
++                     int sdkInt,
++                     boolean androidLowLatencySupported,
++                     boolean maxOperatingRateSupported,
++                     boolean legacyVdecLowLatencyAllowed,
++                     boolean vendorParameterEnumerationAvailable,
++                     Set<String> supportedVendorParameters) {
++            this.family = Objects.requireNonNull(family);
++            this.decoderName = Objects.requireNonNull(decoderName);
++            this.sdkInt = sdkInt;
++            this.androidLowLatencySupported = androidLowLatencySupported;
++            this.maxOperatingRateSupported = maxOperatingRateSupported;
++            this.legacyVdecLowLatencyAllowed = legacyVdecLowLatencyAllowed;
++            this.vendorParameterEnumerationAvailable = vendorParameterEnumerationAvailable;
++
++            TreeSet<String> normalizedParameters = new TreeSet<>();
++            for (String parameter : supportedVendorParameters) {
++                if (parameter != null) {
++                    normalizedParameters.add(parameter.toLowerCase(Locale.US));
++                }
++            }
++            this.supportedVendorParameters = Collections.unmodifiableSet(
++                    new LinkedHashSet<>(normalizedParameters));
++        }
++    }
++
+     static final class Profile {
+         final String name;
+         final Map<String, Integer> integerOptions;
+ 
+         private final List<Map.Entry<String, Integer>> orderedOptions;
+ 
+         Profile(String name, Map<String, Integer> integerOptions) {
+             this.name = Objects.requireNonNull(name);
+ 
+             LinkedHashMap<String, Integer> optionsCopy = new LinkedHashMap<>(integerOptions);
+@@ -41,18 +103,170 @@ final class LowLatencyProfilePlanner {
+             Profile otherProfile = (Profile) other;
+             return orderedOptions.equals(otherProfile.orderedOptions);
+         }
+ 
+         @Override
+         public int hashCode() {
+             return orderedOptions.hashCode();
+         }
+     }
+ 
++    static List<Profile> plan(Capabilities capabilities,
++                              boolean ultraLowLatency,
++                              PlanPurpose purpose) {
++        Objects.requireNonNull(capabilities);
++        Objects.requireNonNull(purpose);
++
++        if (purpose == PlanPurpose.RUNTIME_RECOVERY) {
++            List<Profile> recoveryProfiles = new ArrayList<>();
++            addProfile(recoveryProfiles, "android-standard", standardOptions(capabilities));
++            return deduplicateProfiles(recoveryProfiles);
++        }
++
++        if (capabilities.family == DecoderFamily.QUALCOMM) {
++            return planQualcomm(capabilities, ultraLowLatency);
++        }
++
++        List<Profile> profiles = new ArrayList<>();
++        addProfile(profiles, "android-standard", standardOptions(capabilities));
++        return deduplicateProfiles(profiles);
++    }
++
+     static List<Profile> deduplicateProfiles(List<Profile> profiles) {
+         LinkedHashSet<Profile> uniqueProfiles = new LinkedHashSet<>(profiles);
+         return Collections.unmodifiableList(new ArrayList<>(uniqueProfiles));
+     }
+ 
++    private static List<Profile> planQualcomm(Capabilities capabilities,
++                                               boolean ultraLowLatency) {
++        boolean legacyQualcomm = capabilities.sdkInt >= 26 && capabilities.sdkInt < 31;
++        boolean qtiCore = legacyQualcomm || supportsVendorParameter(capabilities, QTI_CORE);
++        boolean pictureOrder = legacyQualcomm ||
++                supportsVendorParameter(capabilities, QTI_PICTURE_ORDER);
++
++        List<Profile> profiles = new ArrayList<>();
++        if (!ultraLowLatency) {
++            addProfile(profiles, "android-standard", standardOptions(capabilities));
++            addQtiCorePictureProfile(profiles, capabilities, qtiCore, pictureOrder);
++            addQtiCoreOnlyProfile(profiles, qtiCore);
++            return deduplicateProfiles(profiles);
++        }
++
++        boolean outputFence = supportsVendorParameter(capabilities, QTI_OUTPUT_FENCE_ENABLE) &&
++                supportsVendorParameter(capabilities, QTI_OUTPUT_FENCE_TYPE);
++        boolean softwareFence = supportsVendorParameter(capabilities, QTI_SOFTWARE_FENCE);
++
++        LinkedHashMap<String, Integer> full = qtiBaseOptions(
++                capabilities, qtiCore, pictureOrder);
++        addPreferredFence(full, outputFence, softwareFence);
++        addScheduler(full, capabilities);
++        addProfile(profiles, "qti-experimental-full", full);
++
++        if (outputFence && softwareFence) {
++            LinkedHashMap<String, Integer> alternateFence = qtiBaseOptions(
++                    capabilities, qtiCore, pictureOrder);
++            alternateFence.put(QTI_SOFTWARE_FENCE, 1);
++            addScheduler(alternateFence, capabilities);
++            addProfile(profiles, "qti-experimental-alt-fence", alternateFence);
++        }
++
++        LinkedHashMap<String, Integer> noScheduler = qtiBaseOptions(
++                capabilities, qtiCore, pictureOrder);
++        addPreferredFence(noScheduler, outputFence, softwareFence);
++        addProfile(profiles, "qti-experimental-no-scheduler", noScheduler);
++
++        addProfile(profiles, "qti-no-fence",
++                qtiBaseOptions(capabilities, qtiCore, pictureOrder));
++        addProfile(profiles, "android-standard", standardOptions(capabilities));
++        addQtiCorePictureProfile(profiles, capabilities, qtiCore, pictureOrder);
++        addQtiCoreOnlyProfile(profiles, qtiCore);
++
++        return deduplicateProfiles(profiles);
++    }
++
++    private static LinkedHashMap<String, Integer> qtiBaseOptions(
++            Capabilities capabilities,
++            boolean qtiCore,
++            boolean pictureOrder) {
++        LinkedHashMap<String, Integer> options = standardOptions(capabilities);
++        if (qtiCore) {
++            options.put(QTI_CORE, 1);
++        }
++        if (pictureOrder) {
++            options.put(QTI_PICTURE_ORDER,
++                    capabilities.decoderName.toLowerCase(Locale.US).startsWith("omx.qcom") ? 0 : 1);
++        }
++        return options;
++    }
++
++    private static void addQtiCorePictureProfile(List<Profile> profiles,
++                                                  Capabilities capabilities,
++                                                  boolean qtiCore,
++                                                  boolean pictureOrder) {
++        if (!qtiCore || !pictureOrder) {
++            return;
++        }
++
++        LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
++        options.put(QTI_CORE, 1);
++        options.put(QTI_PICTURE_ORDER,
++                capabilities.decoderName.toLowerCase(Locale.US).startsWith("omx.qcom") ? 0 : 1);
++        addProfile(profiles, "qti-core-picture", options);
++    }
++
++    private static void addQtiCoreOnlyProfile(List<Profile> profiles, boolean qtiCore) {
++        if (!qtiCore) {
++            return;
++        }
++
++        LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
++        options.put(QTI_CORE, 1);
++        addProfile(profiles, "qti-core-only", options);
++    }
++
++    private static LinkedHashMap<String, Integer> standardOptions(Capabilities capabilities) {
++        LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
++        if (capabilities.androidLowLatencySupported) {
++            options.put(MediaFormat.KEY_LOW_LATENCY, 1);
++        }
++        return options;
++    }
++
++    private static void addPreferredFence(LinkedHashMap<String, Integer> options,
++                                          boolean outputFence,
++                                          boolean softwareFence) {
++        if (outputFence) {
++            options.put(QTI_OUTPUT_FENCE_ENABLE, 1);
++            options.put(QTI_OUTPUT_FENCE_TYPE, 1);
++        }
++        else if (softwareFence) {
++            options.put(QTI_SOFTWARE_FENCE, 1);
++        }
++    }
++
++    private static void addScheduler(LinkedHashMap<String, Integer> options,
++                                     Capabilities capabilities) {
++        if (capabilities.maxOperatingRateSupported) {
++            options.put(MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE);
++        }
++        else if (capabilities.sdkInt >= 23) {
++            options.put(MediaFormat.KEY_PRIORITY, 0);
++        }
++    }
++
++    private static boolean supportsVendorParameter(Capabilities capabilities, String parameter) {
++        return capabilities.sdkInt >= 31 &&
++                capabilities.vendorParameterEnumerationAvailable &&
++                capabilities.supportedVendorParameters.contains(parameter.toLowerCase(Locale.US));
++    }
++
++    private static void addProfile(List<Profile> profiles,
++                                   String name,
++                                   LinkedHashMap<String, Integer> options) {
++        if (!options.isEmpty()) {
++            profiles.add(new Profile(name, options));
++        }
++    }
++
+     private LowLatencyProfilePlanner() {
+     }
+ }
+diff --git a/app/src/main/java/com/limelight/binding/video/MediaCodecHelper.java b/app/src/main/java/com/limelight/binding/video/MediaCodecHelper.java
+index 9af80484..f85df3b6 100755
+--- a/app/src/main/java/com/limelight/binding/video/MediaCodecHelper.java
++++ b/app/src/main/java/com/limelight/binding/video/MediaCodecHelper.java
+@@ -1,19 +1,24 @@
+ package com.limelight.binding.video;
+ 
+ import java.io.BufferedReader;
+ import java.io.File;
+ import java.io.FileReader;
+ import java.util.Collections;
++import java.util.HashMap;
++import java.util.LinkedHashSet;
+ import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Locale;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeSet;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+ 
+ import android.annotation.SuppressLint;
+ import android.app.ActivityManager;
+ import android.content.Context;
+ import android.content.pm.ConfigurationInfo;
+ import android.media.MediaCodec;
+ import android.media.MediaCodecInfo;
+ import android.media.MediaCodecList;
+@@ -48,20 +53,114 @@ public class MediaCodecHelper {
+     private static final List<String> amlogicDecoderPrefixes;
+     private static final List<String> knownVendorLowLatencyOptions;
+ 
+     public static final boolean SHOULD_BYPASS_SOFTWARE_BLOCK =
+             Build.HARDWARE.equals("ranchu") || Build.HARDWARE.equals("cheets") || Build.BRAND.equals("Android-x86");
+ 
+     private static boolean isLowEndSnapdragon = false;
+     private static boolean isAdreno620 = false;
+     private static boolean initialized = false;
+ 
++    interface VendorParameterSession {
++        List<String> getSupportedVendorParameters() throws Exception;
++        void release();
++    }
++
++    interface VendorParameterProvider {
++        VendorParameterSession open(String decoderName) throws Exception;
++    }
++
++    static final class VendorParameterSnapshot {
++        final boolean enumerationAvailable;
++        final Set<String> supportedParameters;
++
++        private VendorParameterSnapshot(boolean enumerationAvailable,
++                                        Set<String> supportedParameters) {
++            this.enumerationAvailable = enumerationAvailable;
++            this.supportedParameters = Collections.unmodifiableSet(
++                    new LinkedHashSet<>(supportedParameters));
++        }
++
++        private static VendorParameterSnapshot unavailable() {
++            return new VendorParameterSnapshot(false, Collections.emptySet());
++        }
++    }
++
++    static final class VendorParameterCapabilityStore {
++        private final VendorParameterProvider provider;
++        private final Map<String, VendorParameterSnapshot> cache = new HashMap<>();
++
++        VendorParameterCapabilityStore(VendorParameterProvider provider) {
++            this.provider = provider;
++        }
++
++        synchronized VendorParameterSnapshot getSnapshot(String decoderName, int sdkInt) {
++            if (sdkInt < Build.VERSION_CODES.S) {
++                return VendorParameterSnapshot.unavailable();
++            }
++
++            String normalizedDecoderName = decoderName.toLowerCase(Locale.US);
++            VendorParameterSnapshot cachedSnapshot = cache.get(normalizedDecoderName);
++            if (cachedSnapshot != null) {
++                return cachedSnapshot;
++            }
++
++            VendorParameterSession session = null;
++            try {
++                session = provider.open(decoderName);
++                TreeSet<String> normalizedParameters = new TreeSet<>();
++                for (String parameter : session.getSupportedVendorParameters()) {
++                    if (parameter != null) {
++                        normalizedParameters.add(parameter.toLowerCase(Locale.US));
++                    }
++                }
++
++                VendorParameterSnapshot snapshot =
++                        new VendorParameterSnapshot(true, normalizedParameters);
++                cache.put(normalizedDecoderName, snapshot);
++                return snapshot;
++            }
++            catch (Exception e) {
++                LimeLog.warning("Unable to enumerate vendor parameters for " + decoderName +
++                        ": " + e.getMessage());
++                return VendorParameterSnapshot.unavailable();
++            }
++            finally {
++                if (session != null) {
++                    try {
++                        session.release();
++                    }
++                    catch (RuntimeException e) {
++                        LimeLog.warning("Unable to release vendor parameter probe for " +
++                                decoderName + ": " + e.getMessage());
++                    }
++                }
++            }
++        }
++    }
++
++    private static final VendorParameterCapabilityStore vendorParameterCapabilities =
++            new VendorParameterCapabilityStore(decoderName -> {
++                final MediaCodec codec = MediaCodec.createByCodecName(decoderName);
++                return new VendorParameterSession() {
++                    @Override
++                    public List<String> getSupportedVendorParameters() {
++                        return codec.getSupportedVendorParameters();
++                    }
++
++                    @Override
++                    public void release() {
++                        codec.release();
++                    }
++                };
++            });
++
+     static {
+         directSubmitPrefixes = new LinkedList<>();
+ 
+         // These decoders have low enough input buffer latency that they
+         // can be directly invoked from the receive thread
+         directSubmitPrefixes.add("omx.qcom");
+         directSubmitPrefixes.add("omx.sec");
+         directSubmitPrefixes.add("omx.exynos");
+         directSubmitPrefixes.add("omx.intel");
+         directSubmitPrefixes.add("omx.brcm");
+@@ -213,21 +312,25 @@ public class MediaCodecHelper {
+         useFourSlicesPrefixes.add("AVCDecoder");
+         useFourSlicesPrefixes.add("omx.ffmpeg");
+         useFourSlicesPrefixes.add("c2.android");
+ 
+         // Old Qualcomm decoders are detected at runtime
+     }
+ 
+     static {
+         knownVendorLowLatencyOptions = new LinkedList<>();
+ 
+-        knownVendorLowLatencyOptions.add("vendor.qti-ext-dec-low-latency.enable");
++        knownVendorLowLatencyOptions.add(LowLatencyProfilePlanner.QTI_CORE);
++        knownVendorLowLatencyOptions.add(LowLatencyProfilePlanner.QTI_PICTURE_ORDER);
++        knownVendorLowLatencyOptions.add(LowLatencyProfilePlanner.QTI_SOFTWARE_FENCE);
++        knownVendorLowLatencyOptions.add(LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE);
++        knownVendorLowLatencyOptions.add(LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_TYPE);
+         knownVendorLowLatencyOptions.add("vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-req");
+         knownVendorLowLatencyOptions.add("vendor.rtc-ext-dec-low-latency.enable");
+         knownVendorLowLatencyOptions.add("vendor.low-latency.enable");
+     }
+ 
+     static {
+         qualcommDecoderPrefixes = new LinkedList<>();
+ 
+         qualcommDecoderPrefixes.add("omx.qcom");
+         qualcommDecoderPrefixes.add("c2.qti");
+@@ -477,45 +580,35 @@ public class MediaCodecHelper {
+             } catch (Exception e) {
+                 // Tolerate buggy codecs
+                 e.printStackTrace();
+             }
+         }
+ 
+         return false;
+     }
+ 
+     private static boolean decoderSupportsKnownVendorLowLatencyOption(String decoderName) {
+-        // It's only possible to probe vendor parameters on Android 12 and above.
+-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+-            MediaCodec testCodec = null;
+-            try {
+-                // Unfortunately we have to create an actual codec instance to get supported options.
+-                testCodec = MediaCodec.createByCodecName(decoderName);
+-
+-                // See if any of the vendor parameters match ones we know about
+-                for (String supportedOption : testCodec.getSupportedVendorParameters()) {
+-                    for (String knownLowLatencyOption : knownVendorLowLatencyOptions) {
+-                        if (supportedOption.equalsIgnoreCase(knownLowLatencyOption)) {
+-                            LimeLog.info(decoderName + " supports known low latency option: " + supportedOption);
+-                            return true;
+-                        }
+-                    }
+-                }
+-            } catch (Exception e) {
+-                // Tolerate buggy codecs
+-                e.printStackTrace();
+-            } finally {
+-                if (testCodec != null) {
+-                    testCodec.release();
+-                }
++        VendorParameterSnapshot snapshot = vendorParameterCapabilities.getSnapshot(
++                decoderName, Build.VERSION.SDK_INT);
++        if (!snapshot.enumerationAvailable) {
++            return false;
++        }
++
++        for (String knownLowLatencyOption : knownVendorLowLatencyOptions) {
++            if (snapshot.supportedParameters.contains(
++                    knownLowLatencyOption.toLowerCase(Locale.US))) {
++                LimeLog.info(decoderName + " supports known low latency option: " +
++                        knownLowLatencyOption);
++                return true;
+             }
+         }
++
+         return false;
+     }
+ 
+     private static boolean decoderSupportsMaxOperatingRate(String decoderName) {
+         // Operate at maximum rate to lower latency as much as possible on
+         // some Qualcomm platforms. We could also set KEY_PRIORITY to 0 (realtime)
+         // but that will actually result in the decoder crashing if it can't satisfy
+         // our (ludicrous) operating rate requirement. This seems to cause reliable
+         // crashes on the Xiaomi Mi 10 lite 5G and Redmi K30i 5G on Android 10, so
+         // we'll disable it on Snapdragon 765G and all non-Qualcomm devices to be safe.
+@@ -527,20 +620,33 @@ public class MediaCodecHelper {
+                         isDecoderInList(qualcommDecoderPrefixes, decoderName)
+                                 || isDecoderInList(refFrameInvalidationHevcPrefixes, decoderName) ||
+                                 isDecoderInList(refFrameInvalidationAvcPrefixes,  decoderName)
+                 ) && !isAdreno620;
+     }
+ 
+     public static boolean setDecoderLowLatencyOptions(MediaFormat videoFormat, MediaCodecInfo decoderInfo, boolean ultraLowLatency, int tryNumber) {
+         // Options here should be tried in the order of most to least risky. The decoder will use
+         // the first MediaFormat that doesn't fail in configure().
+ 
++        if (isDecoderInList(qualcommDecoderPrefixes, decoderInfo.getName())) {
++            return setDecoderLowLatencyOptions(
++                    videoFormat,
++                    decoderInfo,
++                    ultraLowLatency,
++                    tryNumber,
++                    vendorParameterCapabilities,
++                    Build.VERSION.SDK_INT,
++                    decoderSupportsAndroidRLowLatency(
++                            decoderInfo, videoFormat.getString(MediaFormat.KEY_MIME)),
++                    decoderSupportsMaxOperatingRate(decoderInfo.getName()));
++        }
++
+         boolean setNewOption = false;
+ 
+ //derflacco
+         // NVIDIA Tegra extra low-latency toggles
+         if (isNvidiaDecoder(decoderInfo.getName())) {
+             safeSet(videoFormat, "media.low-latency.enable", 1);
+             safeSet(videoFormat, "vendor.low-latency.enable", 1);
+             safeSet(videoFormat, "disable-output-reorder", 1);
+             safeSet(videoFormat, "vendor.nvidia.disable-output-reorder", 1);
+             setNewOption = true;
+@@ -592,55 +698,29 @@ public class MediaCodecHelper {
+         // MediaCodec supports vendor-defined format keys using the "vendor.<extension name>.<parameter name>" syntax.
+         // These allow access to functionality that is not exposed through documented MediaFormat.KEY_* values.
+         // https://cs.android.com/android/platform/superproject/+/master:hardware/qcom/sdm845/media/mm-video-v4l2/vidc/common/inc/vidc_vendor_extensions.h;l=67
+         //
+         // MediaCodec vendor extension support was introduced in Android 8.0:
+         // https://cs.android.com/android/_/android/platform/frameworks/av/+/01c10f8cdcd58d1e7025f426a72e6e75ba5d7fc2
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+             // Try vendor-specific low latency options
+             //
+             // NOTE: Update knownVendorLowLatencyOptions if you modify this code!
+-            if (isDecoderInList(qualcommDecoderPrefixes, decoderInfo.getName())) {
+-                // Examples of Qualcomm's vendor extensions for Snapdragon 845:
+-                // https://cs.android.com/android/platform/superproject/+/master:hardware/qcom/sdm845/media/mm-video-v4l2/vidc/vdec/src/omx_vdec_extensions.hpp
+-                // https://cs.android.com/android/_/android/platform/hardware/qcom/sm8150/media/+/0621ceb1c1b19564999db8293574a0e12952ff6c
+-                //
+-                // We will first try both, then try vendor.qti-ext-dec-low-latency.enable alone if that fails
+-                if (tryNumber < 4) {
+-                    // Adjust picture-order flag: 0 for OMX.qcom (disable reordering), 1 for C2.*
+-                    boolean __isOmxQcom = decoderInfo.getName() != null &&
+-                            decoderInfo.getName().toLowerCase(java.util.Locale.US).startsWith("omx.qcom");
+-                    safeSet(videoFormat, "vendor.qti-ext-dec-picture-order.enable", __isOmxQcom ? 0 : 1);
+-                    setNewOption = true;
+-                }
+-                if (tryNumber < 5) {
+-                    videoFormat.setInteger("vendor.qti-ext-dec-low-latency.enable", 1);
+-
+-                    //ALONSOJR1980 - CONFIRMED WORKING: Snapdragon Elite, SD8 gen 3, SD8 gen 2
+-                    //latency-wise, software fencing is the most important flag for latest Snapdragons
+-                    videoFormat.setInteger("vendor.qti-ext-output-sw-fence-enable.value", 1); //Snapdragon 8 gen 2
+-                    videoFormat.setInteger("vendor.qti-ext-output-fence.enable", 1); // Snapdragon 8s Gen 3 and Elite
+-                    videoFormat.setInteger("vendor.qti-ext-output-fence.fence_type", 1); // Snapdragon 8s Gen 3 and ELite / 0 = none, 1 = sw, 2 = hw, 3 = hybrid. Best option = 1
+-                    ////////////////////////////////////////////////////////////////////////////////
+-
+-                    setNewOption = true;
+-                }
+-            }
+             // ALONSOJR1980
+ //            else if (isDecoderInList(mtkDecoderPrefixes, decoderInfo.getName())) {
+ //                if (tryNumber < 4) {
+ //
+ //                    videoFormat.setInteger("vendor.mtk.vdec.cpu.boost.mode.value", 2);
+ //                    videoFormat.setInteger("vendor.mtk.ext.dolby.vision.cpu-boost", 1);
+ //                    videoFormat.setInteger("vendor.mtk.vdec.bq.guard.interval.time.value", 2);
+ //                    videoFormat.setInteger("vendor.mtk.vdec.buffer.fetch.timeout.ms.value", 2);
+-            else if (isDecoderInList(mtkDecoderPrefixes, decoderInfo.getName())) {
++            if (isDecoderInList(mtkDecoderPrefixes, decoderInfo.getName())) {
+                 if (tryNumber < 4) {
+                     // --- PRESET: MTK Low-Latency (safe & balanced, no duplicates) ---
+ 
+                     // Boost/DVFS: moderate profile
+                     safeSet(videoFormat, "vdec-lowlatency", 1);
+                     safeSet(videoFormat, "vendor.mtk.vdec.cpu.boost.mode", 1);
+                     safeSet(videoFormat, "vendor.mtk.vdec.cpu.boost.mode.value", 1);
+                     safeSet(videoFormat, "vendor.mtk.vdec.dvfs.mode", 1);
+                     safeSet(videoFormat, "vendor.mtk.vdec.dvfs.level", 1);
+ 
+@@ -694,20 +774,61 @@ public class MediaCodecHelper {
+                     // https://github.com/codewalkerster/android_vendor_amlogic_common_prebuilt_libstagefrighthw/commit/41fefc4e035c476d58491324a5fe7666bfc2989e
+                     videoFormat.setInteger("vendor.low-latency.enable", 1);
+                     setNewOption = true;
+                 }
+             }
+         }
+ 
+         return setNewOption;
+     }
+ 
++    static boolean setDecoderLowLatencyOptions(
++            MediaFormat videoFormat,
++            MediaCodecInfo decoderInfo,
++            boolean ultraLowLatency,
++            int tryNumber,
++            VendorParameterCapabilityStore capabilityStore,
++            int sdkInt,
++            boolean androidLowLatencySupported,
++            boolean maxOperatingRateSupported) {
++        if (!isDecoderInList(qualcommDecoderPrefixes, decoderInfo.getName()) || tryNumber < 0) {
++            return false;
++        }
++
++        VendorParameterSnapshot snapshot = capabilityStore.getSnapshot(
++                decoderInfo.getName(), sdkInt);
++        LowLatencyProfilePlanner.Capabilities capabilities =
++                new LowLatencyProfilePlanner.Capabilities(
++                        LowLatencyProfilePlanner.DecoderFamily.QUALCOMM,
++                        decoderInfo.getName(),
++                        sdkInt,
++                        androidLowLatencySupported,
++                        maxOperatingRateSupported,
++                        false,
++                        snapshot.enumerationAvailable,
++                        snapshot.supportedParameters);
++        List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                capabilities,
++                ultraLowLatency,
++                LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++
++        if (tryNumber >= profiles.size()) {
++            return false;
++        }
++
++        LowLatencyProfilePlanner.Profile profile = profiles.get(tryNumber);
++        for (Map.Entry<String, Integer> option : profile.integerOptions.entrySet()) {
++            videoFormat.setInteger(option.getKey(), option.getValue());
++        }
++        return true;
++    }
++
+     public static boolean decoderSupportsFusedIdrFrame(MediaCodecInfo decoderInfo, String mimeType) {
+         // If adaptive playback is supported, we can submit new CSD together with a keyframe
+         try {
+             if (decoderInfo.getCapabilitiesForType(mimeType).
+                     isFeatureSupported(CodecCapabilities.FEATURE_AdaptivePlayback)) {
+                 LimeLog.info("Decoder supports fused IDR frames (FEATURE_AdaptivePlayback)");
+                 return true;
+             }
+         } catch (Exception e) {
+             // Tolerate buggy codecs
+diff --git a/app/src/test/java/com/limelight/binding/video/LowLatencyProfilePlannerTest.java b/app/src/test/java/com/limelight/binding/video/LowLatencyProfilePlannerTest.java
+index a2268396..c67f8907 100644
+--- a/app/src/test/java/com/limelight/binding/video/LowLatencyProfilePlannerTest.java
++++ b/app/src/test/java/com/limelight/binding/video/LowLatencyProfilePlannerTest.java
+@@ -1,23 +1,36 @@
+ package com.limelight.binding.video;
+ 
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ 
++import android.media.MediaFormat;
++
+ import org.junit.Test;
+ 
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.Collections;
+ import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
+ import java.util.List;
++import java.util.Map;
++import java.util.Set;
+ 
+ public class LowLatencyProfilePlannerTest {
++    private static final Set<String> S25_VENDOR_PARAMETERS = parameters(
++            LowLatencyProfilePlanner.QTI_PICTURE_ORDER,
++            LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE,
++            LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_TYPE);
++
+     @Test
+     public void profileOptionsAreOrderedAndImmutable() {
+         LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
+         options.put("low-latency", 1);
+         options.put("vendor.test.option", 2);
+ 
+         LowLatencyProfilePlanner.Profile profile =
+                 new LowLatencyProfilePlanner.Profile("test-profile", options);
+         options.put("added-after-construction", 3);
+ 
+@@ -45,20 +58,336 @@ public class LowLatencyProfilePlannerTest {
+ 
+         List<LowLatencyProfilePlanner.Profile> profiles =
+                 LowLatencyProfilePlanner.deduplicateProfiles(
+                         Arrays.asList(first, duplicate, reverseOrder));
+ 
+         assertEquals(2, profiles.size());
+         assertEquals("first", profiles.get(0).name);
+         assertEquals("reverse-order", profiles.get(1).name);
+     }
+ 
++    @Test
++    public void standardOffReturnsAndroidStandardOptionProfileOnly() {
++        List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                capabilities("vendor.decoder", 36, true, false, true, Collections.emptySet()),
++                false,
++                LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++
++        assertEquals(1, profiles.size());
++        assertEquals("android-standard", profiles.get(0).name);
++        assertEquals(singleOption(MediaFormat.KEY_LOW_LATENCY, 1), profiles.get(0).integerOptions);
++    }
++
++    @Test
++    public void runtimeRecoveryReturnsOnlyStandardWhenSupported() {
++        List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                capabilities("c2.qti.avc.decoder", 36, true, true, true, S25_VENDOR_PARAMETERS),
++                true,
++                LowLatencyProfilePlanner.PlanPurpose.RUNTIME_RECOVERY);
++
++        assertEquals(1, profiles.size());
++        assertEquals("android-standard", profiles.get(0).name);
++        assertEquals(singleOption(MediaFormat.KEY_LOW_LATENCY, 1), profiles.get(0).integerOptions);
++    }
++
++    @Test
++    public void capabilitiesNormalizeAndDefensivelyCopyVendorParameters() {
++        Set<String> parameters = parameters("Vendor.QTI-Ext-Dec-Low-Latency.Enable");
++        LowLatencyProfilePlanner.Capabilities capabilities = capabilities(
++                "c2.qti.avc.decoder", 36, true, true, true, parameters);
++        parameters.add("vendor.added.after.construction");
++
++        assertEquals(parameters(LowLatencyProfilePlanner.QTI_CORE),
++                capabilities.supportedVendorParameters);
++        try {
++            capabilities.supportedVendorParameters.add("mutation");
++            fail("Capabilities must be immutable");
++        }
++        catch (UnsupportedOperationException expected) {
++            // Expected.
++        }
++    }
++
++    @Test
++    public void qtiS25UsesOnlyAdvertisedOutputFenceFamily() {
++        List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                capabilities("c2.qti.hevc.decoder.low_latency", 36, true, true, true,
++                        S25_VENDOR_PARAMETERS),
++                true,
++                LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++
++        assertEquals(Arrays.asList(
++                        "qti-experimental-full",
++                        "qti-experimental-no-scheduler",
++                        "qti-no-fence",
++                        "android-standard"),
++                profileNames(profiles));
++
++        Map<String, Integer> full = profiles.get(0).integerOptions;
++        assertFalse(full.containsKey(LowLatencyProfilePlanner.VDEC_LOW_LATENCY));
++        assertFalse(full.containsKey(LowLatencyProfilePlanner.QTI_CORE));
++        assertFalse(full.containsKey(LowLatencyProfilePlanner.QTI_SOFTWARE_FENCE));
++        assertEquals(1, full.get(LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE).intValue());
++        assertEquals(1, full.get(LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_TYPE).intValue());
++        assertEquals(Arrays.asList(
++                        MediaFormat.KEY_LOW_LATENCY,
++                        LowLatencyProfilePlanner.QTI_PICTURE_ORDER,
++                        LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE,
++                        LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_TYPE,
++                        MediaFormat.KEY_OPERATING_RATE),
++                new ArrayList<>(full.keySet()));
++    }
++
++    @Test
++    public void qtiAdvertisedCoreIncludesTrueCoreOnlyFallback() {
++        List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                capabilities("c2.qti.avc.decoder", 36, true, true, true,
++                        parameters(LowLatencyProfilePlanner.QTI_CORE,
++                                LowLatencyProfilePlanner.QTI_PICTURE_ORDER)),
++                false,
++                LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++
++        assertEquals(Arrays.asList("android-standard", "qti-core-picture", "qti-core-only"),
++                profileNames(profiles));
++        assertEquals(singleOption(LowLatencyProfilePlanner.QTI_CORE, 1),
++                profiles.get(2).integerOptions);
++    }
++
++    @Test
++    public void qtiNeverMixesSoftwareAndOutputFenceFamilies() {
++        Set<String> advertised = parameters(
++                LowLatencyProfilePlanner.QTI_CORE,
++                LowLatencyProfilePlanner.QTI_PICTURE_ORDER,
++                LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE,
++                LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_TYPE,
++                LowLatencyProfilePlanner.QTI_SOFTWARE_FENCE);
++
++        List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                capabilities("c2.qti.avc.decoder", 36, true, true, true, advertised),
++                true,
++                LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++
++        assertEquals("qti-experimental-full", profiles.get(0).name);
++        assertEquals("qti-experimental-alt-fence", profiles.get(1).name);
++        assertTrue(profiles.get(0).integerOptions.containsKey(
++                LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE));
++        assertFalse(profiles.get(0).integerOptions.containsKey(
++                LowLatencyProfilePlanner.QTI_SOFTWARE_FENCE));
++        assertTrue(profiles.get(1).integerOptions.containsKey(
++                LowLatencyProfilePlanner.QTI_SOFTWARE_FENCE));
++        assertFalse(profiles.get(1).integerOptions.containsKey(
++                LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE));
++
++        for (LowLatencyProfilePlanner.Profile profile : profiles) {
++            assertFalse(profile.integerOptions.containsKey(
++                            LowLatencyProfilePlanner.QTI_SOFTWARE_FENCE) &&
++                    profile.integerOptions.containsKey(
++                            LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE));
++        }
++    }
++
++    @Test
++    public void qtiPartialOutputFencePairIsNotUsed() {
++        for (String partialKey : Arrays.asList(
++                LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE,
++                LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_TYPE)) {
++            List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                    capabilities("c2.qti.avc.decoder", 36, true, true, true,
++                            parameters(partialKey)),
++                    true,
++                    LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++
++            for (LowLatencyProfilePlanner.Profile profile : profiles) {
++                assertFalse(profile.integerOptions.containsKey(
++                        LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE));
++                assertFalse(profile.integerOptions.containsKey(
++                        LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_TYPE));
++            }
++        }
++    }
++
++    @Test
++    public void qtiPartialOutputFenceFallsBackToAdvertisedSoftwareFence() {
++        List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                capabilities("c2.qti.avc.decoder", 36, true, true, true,
++                        parameters(LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE,
++                                LowLatencyProfilePlanner.QTI_SOFTWARE_FENCE)),
++                true,
++                LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++
++        assertTrue(profiles.get(0).integerOptions.containsKey(
++                LowLatencyProfilePlanner.QTI_SOFTWARE_FENCE));
++        assertFalse(profiles.get(0).integerOptions.containsKey(
++                LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE));
++        assertFalse(profiles.get(0).integerOptions.containsKey(
++                LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_TYPE));
++    }
++
++    @Test
++    public void qtiApi31EmptyOrFailedEnumerationUsesNoVendorKeys() {
++        for (boolean enumerationAvailable : Arrays.asList(true, false)) {
++            List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                    capabilities("c2.qti.avc.decoder", 31, true, true,
++                            enumerationAvailable, Collections.emptySet()),
++                    true,
++                    LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++
++            for (LowLatencyProfilePlanner.Profile profile : profiles) {
++                for (String key : profile.integerOptions.keySet()) {
++                    assertFalse(key.startsWith("vendor.qti-"));
++                }
++            }
++        }
++    }
++
++    @Test
++    public void qtiLegacyApi26To30UsesCoreAndPictureButNeverFences() {
++        for (int sdkInt : Arrays.asList(26, 30)) {
++            List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                    capabilities("c2.qti.avc.decoder", sdkInt, false, false,
++                            false, Collections.emptySet()),
++                    false,
++                    LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++
++            assertEquals(Arrays.asList("qti-core-picture", "qti-core-only"),
++                    profileNames(profiles));
++            assertTrue(profiles.get(0).integerOptions.containsKey(
++                    LowLatencyProfilePlanner.QTI_CORE));
++            assertTrue(profiles.get(0).integerOptions.containsKey(
++                    LowLatencyProfilePlanner.QTI_PICTURE_ORDER));
++            assertNoFenceKeys(profiles);
++        }
++    }
++
++    @Test
++    public void qtiPictureOrderMatchesOmxAndCodec2Contracts() {
++        assertEquals(0, pictureOrderFor("OMX.qcom.video.decoder.avc"));
++        assertEquals(1, pictureOrderFor("c2.qti.avc.decoder"));
++        assertEquals(1, pictureOrderFor("c2.qcom.avc.decoder"));
++    }
++
++    @Test
++    public void qtiNeverUsesVdecLowLatency() {
++        List<LowLatencyProfilePlanner.Capabilities> fixtures = Arrays.asList(
++                capabilities("OMX.qcom.video.decoder.avc", 26, false, true,
++                        false, Collections.emptySet()),
++                capabilities("c2.qti.avc.decoder", 36, true, true, true,
++                        parameters(LowLatencyProfilePlanner.QTI_CORE,
++                                LowLatencyProfilePlanner.QTI_PICTURE_ORDER,
++                                LowLatencyProfilePlanner.QTI_SOFTWARE_FENCE)));
++
++        for (LowLatencyProfilePlanner.Capabilities fixture : fixtures) {
++            for (boolean ultraLowLatency : Arrays.asList(false, true)) {
++                List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                        fixture,
++                        ultraLowLatency,
++                        LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++                for (LowLatencyProfilePlanner.Profile profile : profiles) {
++                    assertFalse(profile.integerOptions.containsKey(
++                            LowLatencyProfilePlanner.VDEC_LOW_LATENCY));
++                }
++            }
++        }
++    }
++
++    @Test
++    public void qtiSchedulerUsesOperatingRateOrPriorityButNeverBoth() {
++        List<LowLatencyProfilePlanner.Profile> operatingRateProfiles =
++                LowLatencyProfilePlanner.plan(
++                        capabilities("c2.qti.avc.decoder", 36, true, true, true,
++                                S25_VENDOR_PARAMETERS),
++                        true,
++                        LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++        Map<String, Integer> operatingRate = operatingRateProfiles.get(0).integerOptions;
++        assertEquals((int) Short.MAX_VALUE,
++                operatingRate.get(MediaFormat.KEY_OPERATING_RATE).intValue());
++        assertFalse(operatingRate.containsKey(MediaFormat.KEY_PRIORITY));
++
++        List<LowLatencyProfilePlanner.Profile> priorityProfiles =
++                LowLatencyProfilePlanner.plan(
++                        capabilities("c2.qti.avc.decoder", 36, true, false, true,
++                                S25_VENDOR_PARAMETERS),
++                        true,
++                        LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++        Map<String, Integer> priority = priorityProfiles.get(0).integerOptions;
++        assertEquals(0, priority.get(MediaFormat.KEY_PRIORITY).intValue());
++        assertFalse(priority.containsKey(MediaFormat.KEY_OPERATING_RATE));
++    }
++
++    @Test
++    public void plannerNeverReturnsEmptyBaseProfile() {
++        List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                capabilities("c2.qti.avc.decoder", 36, false, false,
++                        true, Collections.emptySet()),
++                false,
++                LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++
++        assertTrue(profiles.isEmpty());
++    }
++
++    private static LowLatencyProfilePlanner.Capabilities capabilities(
++            String decoderName,
++            int sdkInt,
++            boolean androidLowLatencySupported,
++            boolean maxOperatingRateSupported,
++            boolean vendorParameterEnumerationAvailable,
++            Set<String> supportedVendorParameters) {
++        return new LowLatencyProfilePlanner.Capabilities(
++                LowLatencyProfilePlanner.DecoderFamily.QUALCOMM,
++                decoderName,
++                sdkInt,
++                androidLowLatencySupported,
++                maxOperatingRateSupported,
++                false,
++                vendorParameterEnumerationAvailable,
++                supportedVendorParameters);
++    }
++
++    private static int pictureOrderFor(String decoderName) {
++        List<LowLatencyProfilePlanner.Profile> profiles = LowLatencyProfilePlanner.plan(
++                capabilities(decoderName, 30, false, false,
++                        false, Collections.emptySet()),
++                false,
++                LowLatencyProfilePlanner.PlanPurpose.INITIAL_CONFIGURATION);
++        return profiles.get(0).integerOptions.get(
++                LowLatencyProfilePlanner.QTI_PICTURE_ORDER);
++    }
++
++    private static void assertNoFenceKeys(List<LowLatencyProfilePlanner.Profile> profiles) {
++        for (LowLatencyProfilePlanner.Profile profile : profiles) {
++            assertFalse(profile.integerOptions.containsKey(
++                    LowLatencyProfilePlanner.QTI_SOFTWARE_FENCE));
++            assertFalse(profile.integerOptions.containsKey(
++                    LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE));
++            assertFalse(profile.integerOptions.containsKey(
++                    LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_TYPE));
++        }
++    }
++
++    private static List<String> profileNames(List<LowLatencyProfilePlanner.Profile> profiles) {
++        List<String> names = new ArrayList<>();
++        for (LowLatencyProfilePlanner.Profile profile : profiles) {
++            names.add(profile.name);
++        }
++        return names;
++    }
++
++    private static Set<String> parameters(String... values) {
++        return new LinkedHashSet<>(Arrays.asList(values));
++    }
++
++    private static Map<String, Integer> singleOption(String key, int value) {
++        LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
++        options.put(key, value);
++        return options;
++    }
++
+     private static LowLatencyProfilePlanner.Profile profile(
+             String name,
+             String firstKey,
+             int firstValue,
+             String secondKey,
+             int secondValue) {
+         LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
+         options.put(firstKey, firstValue);
+         options.put(secondKey, secondValue);
+         return new LowLatencyProfilePlanner.Profile(name, options);
+diff --git a/app/src/test/java/com/limelight/binding/video/MediaCodecLowLatencyCapabilityTest.java b/app/src/test/java/com/limelight/binding/video/MediaCodecLowLatencyCapabilityTest.java
+new file mode 100644
+index 00000000..5d464f4e
+--- /dev/null
++++ b/app/src/test/java/com/limelight/binding/video/MediaCodecLowLatencyCapabilityTest.java
+@@ -0,0 +1,414 @@
++package com.limelight.binding.video;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertSame;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++import android.media.MediaCodecInfo;
++import android.media.MediaFormat;
++
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.robolectric.RobolectricTestRunner;
++import org.robolectric.RuntimeEnvironment;
++import org.robolectric.annotation.Config;
++
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.CyclicBarrier;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
++
++@RunWith(RobolectricTestRunner.class)
++@Config(sdk = {33})
++public class MediaCodecLowLatencyCapabilityTest {
++    private static final List<String> LOW_LATENCY_OPTION_KEYS = Arrays.asList(
++            MediaFormat.KEY_LOW_LATENCY,
++            LowLatencyProfilePlanner.VDEC_LOW_LATENCY,
++            LowLatencyProfilePlanner.QTI_CORE,
++            LowLatencyProfilePlanner.QTI_PICTURE_ORDER,
++            LowLatencyProfilePlanner.QTI_SOFTWARE_FENCE,
++            LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE,
++            LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_TYPE,
++            MediaFormat.KEY_OPERATING_RATE,
++            MediaFormat.KEY_PRIORITY);
++
++    @Before
++    public void initializeCodecHelper() {
++        MediaCodecHelper.initialize(RuntimeEnvironment.getApplication(), "Adreno 740");
++    }
++
++    @Test
++    public void advertisedParametersAreNormalizedImmutableCachedAndReleased() {
++        AtomicInteger openCount = new AtomicInteger();
++        AtomicInteger releaseCount = new AtomicInteger();
++        MediaCodecHelper.VendorParameterCapabilityStore store =
++                new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
++                    openCount.incrementAndGet();
++                    return session(Arrays.asList(
++                            "Vendor.QTI-Ext-Output-Fence.Enable",
++                            "vendor.qti-ext-dec-picture-order.enable"), releaseCount);
++                });
++
++        MediaCodecHelper.VendorParameterSnapshot first =
++                store.getSnapshot("C2.QTI.AVC.Decoder", 31);
++        MediaCodecHelper.VendorParameterSnapshot cached =
++                store.getSnapshot("c2.qti.avc.decoder", 36);
++
++        assertTrue(first.enumerationAvailable);
++        assertEquals(Arrays.asList(
++                        "vendor.qti-ext-dec-picture-order.enable",
++                        "vendor.qti-ext-output-fence.enable"),
++                Arrays.asList(first.supportedParameters.toArray(new String[0])));
++        assertEquals(first.supportedParameters, cached.supportedParameters);
++        assertEquals(1, openCount.get());
++        assertEquals(1, releaseCount.get());
++
++        try {
++            first.supportedParameters.add("mutation");
++            fail("Vendor parameter snapshot must be immutable");
++        }
++        catch (UnsupportedOperationException expected) {
++            // Expected.
++        }
++    }
++
++    @Test
++    public void successfulEmptyEnumerationIsAvailableAndCached() {
++        AtomicInteger openCount = new AtomicInteger();
++        AtomicInteger releaseCount = new AtomicInteger();
++        MediaCodecHelper.VendorParameterCapabilityStore store =
++                new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
++                    openCount.incrementAndGet();
++                    return session(Collections.emptyList(), releaseCount);
++                });
++
++        MediaCodecHelper.VendorParameterSnapshot first =
++                store.getSnapshot("c2.qti.hevc.decoder", 31);
++        MediaCodecHelper.VendorParameterSnapshot second =
++                store.getSnapshot("C2.QTI.HEVC.DECODER", 31);
++
++        assertTrue(first.enumerationAvailable);
++        assertTrue(first.supportedParameters.isEmpty());
++        assertTrue(second.enumerationAvailable);
++        assertEquals(1, openCount.get());
++        assertEquals(1, releaseCount.get());
++    }
++
++    @Test
++    public void failedEnumerationIsUnavailableReleasedAndNotCached() {
++        AtomicInteger openCount = new AtomicInteger();
++        AtomicInteger releaseCount = new AtomicInteger();
++        MediaCodecHelper.VendorParameterCapabilityStore store =
++                new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
++                    openCount.incrementAndGet();
++                    return new MediaCodecHelper.VendorParameterSession() {
++                        @Override
++                        public List<String> getSupportedVendorParameters() throws Exception {
++                            throw new Exception("codec query failed");
++                        }
++
++                        @Override
++                        public void release() {
++                            releaseCount.incrementAndGet();
++                        }
++                    };
++                });
++
++        MediaCodecHelper.VendorParameterSnapshot first =
++                store.getSnapshot("c2.qti.av1.decoder", 31);
++        MediaCodecHelper.VendorParameterSnapshot retried =
++                store.getSnapshot("C2.QTI.AV1.DECODER", 31);
++
++        assertFalse(first.enumerationAvailable);
++        assertTrue(first.supportedParameters.isEmpty());
++        assertFalse(retried.enumerationAvailable);
++        assertEquals(2, openCount.get());
++        assertEquals(2, releaseCount.get());
++    }
++
++    @Test
++    public void api26And30NeverOpenProvider() {
++        AtomicInteger openCount = new AtomicInteger();
++        MediaCodecHelper.VendorParameterCapabilityStore store =
++                new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
++                    openCount.incrementAndGet();
++                    throw new AssertionError("Provider must not be opened before API 31");
++                });
++
++        for (int sdkInt : Arrays.asList(26, 30)) {
++            MediaCodecHelper.VendorParameterSnapshot snapshot =
++                    store.getSnapshot("c2.qti.avc.decoder", sdkInt);
++            assertFalse(snapshot.enumerationAvailable);
++            assertTrue(snapshot.supportedParameters.isEmpty());
++        }
++        assertEquals(0, openCount.get());
++    }
++
++    @Test
++    public void concurrentCaseVariantLookupsShareOneCompleteSnapshot() throws Exception {
++        AtomicInteger openCount = new AtomicInteger();
++        AtomicInteger enumerationCount = new AtomicInteger();
++        AtomicInteger releaseCount = new AtomicInteger();
++        CyclicBarrier callersReady = new CyclicBarrier(2);
++        CountDownLatch enumerationEntered = new CountDownLatch(1);
++        CountDownLatch allowEnumerationToComplete = new CountDownLatch(1);
++        MediaCodecHelper.VendorParameterCapabilityStore store =
++                new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
++                    openCount.incrementAndGet();
++                    return new MediaCodecHelper.VendorParameterSession() {
++                        @Override
++                        public List<String> getSupportedVendorParameters() throws Exception {
++                            enumerationCount.incrementAndGet();
++                            enumerationEntered.countDown();
++                            if (!allowEnumerationToComplete.await(5, TimeUnit.SECONDS)) {
++                                throw new AssertionError("Timed out waiting to complete enumeration");
++                            }
++                            return Arrays.asList(
++                                    "Vendor.QTI-Ext-Dec-Picture-Order.Enable",
++                                    "vendor.qti-ext-output-fence.enable");
++                        }
++
++                        @Override
++                        public void release() {
++                            releaseCount.incrementAndGet();
++                        }
++                    };
++                });
++        ExecutorService executor = Executors.newFixedThreadPool(2);
++
++        try {
++            Future<MediaCodecHelper.VendorParameterSnapshot> firstFuture = executor.submit(() -> {
++                callersReady.await(5, TimeUnit.SECONDS);
++                return store.getSnapshot("C2.QTI.AVC.Decoder", 33);
++            });
++            Future<MediaCodecHelper.VendorParameterSnapshot> secondFuture = executor.submit(() -> {
++                callersReady.await(5, TimeUnit.SECONDS);
++                return store.getSnapshot("c2.qti.avc.decoder", 33);
++            });
++
++            assertTrue(enumerationEntered.await(5, TimeUnit.SECONDS));
++            allowEnumerationToComplete.countDown();
++
++            MediaCodecHelper.VendorParameterSnapshot first =
++                    firstFuture.get(5, TimeUnit.SECONDS);
++            MediaCodecHelper.VendorParameterSnapshot second =
++                    secondFuture.get(5, TimeUnit.SECONDS);
++
++            assertSame(first, second);
++            assertTrue(first.enumerationAvailable);
++            assertEquals(Arrays.asList(
++                            "vendor.qti-ext-dec-picture-order.enable",
++                            "vendor.qti-ext-output-fence.enable"),
++                    Arrays.asList(first.supportedParameters.toArray(new String[0])));
++            assertEquals(1, openCount.get());
++            assertEquals(1, enumerationCount.get());
++            assertEquals(1, releaseCount.get());
++            try {
++                first.supportedParameters.add("mutation");
++                fail("Concurrent snapshot must be immutable");
++            }
++            catch (UnsupportedOperationException expected) {
++                // Expected.
++            }
++        }
++        finally {
++            allowEnumerationToComplete.countDown();
++            executor.shutdownNow();
++            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
++        }
++    }
++
++    @Test
++    public void qualcommHelperAppliesOneS25ProfilePerAttemptAndTerminates() {
++        AtomicInteger openCount = new AtomicInteger();
++        AtomicInteger releaseCount = new AtomicInteger();
++        MediaCodecHelper.VendorParameterCapabilityStore store = s25Store(
++                openCount, releaseCount);
++        MediaCodecInfo decoderInfo = mock(MediaCodecInfo.class);
++        when(decoderInfo.getName()).thenReturn("c2.qti.avc.decoder.low_latency");
++
++        List<Map<String, Integer>> expectedProfiles = Arrays.asList(
++                options(
++                        MediaFormat.KEY_LOW_LATENCY, 1,
++                        LowLatencyProfilePlanner.QTI_PICTURE_ORDER, 1,
++                        LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE, 1,
++                        LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_TYPE, 1,
++                        MediaFormat.KEY_OPERATING_RATE, (int) Short.MAX_VALUE),
++                options(
++                        MediaFormat.KEY_LOW_LATENCY, 1,
++                        LowLatencyProfilePlanner.QTI_PICTURE_ORDER, 1,
++                        LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE, 1,
++                        LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_TYPE, 1),
++                options(
++                        MediaFormat.KEY_LOW_LATENCY, 1,
++                        LowLatencyProfilePlanner.QTI_PICTURE_ORDER, 1),
++                options(MediaFormat.KEY_LOW_LATENCY, 1));
++
++        for (int tryNumber = 0; tryNumber < expectedProfiles.size(); tryNumber++) {
++            MediaFormat format = videoFormat();
++            assertTrue(MediaCodecHelper.setDecoderLowLatencyOptions(
++                    format,
++                    decoderInfo,
++                    true,
++                    tryNumber,
++                    store,
++                    33,
++                    true,
++                    true));
++            assertEquals(expectedProfiles.get(tryNumber).keySet(), optionKeys(format));
++            assertEquals(expectedProfiles.get(tryNumber), lowLatencyOptions(format));
++        }
++
++        MediaFormat exhausted = videoFormat();
++        String exhaustedBefore = exhausted.toString();
++        assertFalse(MediaCodecHelper.setDecoderLowLatencyOptions(
++                exhausted,
++                decoderInfo,
++                true,
++                expectedProfiles.size(),
++                store,
++                33,
++                true,
++                true));
++        assertEquals(exhaustedBefore, exhausted.toString());
++        assertTrue(lowLatencyOptions(exhausted).isEmpty());
++        assertEquals(1, openCount.get());
++        assertEquals(1, releaseCount.get());
++    }
++
++    @Test
++    public void qualcommHelperUllOffStartsWithStandardAndRejectsInvalidAttempts() {
++        MediaCodecHelper.VendorParameterCapabilityStore store =
++                s25Store(new AtomicInteger(), new AtomicInteger());
++        MediaCodecInfo decoderInfo = mock(MediaCodecInfo.class);
++        when(decoderInfo.getName()).thenReturn("c2.qti.hevc.decoder.low_latency");
++
++        MediaFormat standard = videoFormat();
++        assertTrue(MediaCodecHelper.setDecoderLowLatencyOptions(
++                standard,
++                decoderInfo,
++                false,
++                0,
++                store,
++                33,
++                true,
++                true));
++        assertEquals(options(MediaFormat.KEY_LOW_LATENCY, 1),
++                lowLatencyOptions(standard));
++
++        for (int invalidAttempt : Arrays.asList(-1, 1, 100)) {
++            MediaFormat untouched = videoFormat();
++            String untouchedBefore = untouched.toString();
++            assertFalse(MediaCodecHelper.setDecoderLowLatencyOptions(
++                    untouched,
++                    decoderInfo,
++                    false,
++                    invalidAttempt,
++                    store,
++                    33,
++                    true,
++                    true));
++            assertEquals(untouchedBefore, untouched.toString());
++            assertTrue(lowLatencyOptions(untouched).isEmpty());
++        }
++    }
++
++    @Test
++    public void injectableHelperRejectsNonQualcommWithoutOpeningProvider() {
++        AtomicInteger openCount = new AtomicInteger();
++        MediaCodecHelper.VendorParameterCapabilityStore store =
++                new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
++                    openCount.incrementAndGet();
++                    throw new AssertionError("Non-Qualcomm decoder must not probe QTI parameters");
++                });
++        MediaCodecInfo decoderInfo = mock(MediaCodecInfo.class);
++        when(decoderInfo.getName()).thenReturn("c2.exynos.avc.decoder");
++        MediaFormat format = videoFormat();
++        String before = format.toString();
++
++        assertFalse(MediaCodecHelper.setDecoderLowLatencyOptions(
++                format,
++                decoderInfo,
++                true,
++                0,
++                store,
++                33,
++                true,
++                true));
++        assertEquals(before, format.toString());
++        assertEquals(0, openCount.get());
++    }
++
++    private static MediaCodecHelper.VendorParameterCapabilityStore s25Store(
++            AtomicInteger openCount,
++            AtomicInteger releaseCount) {
++        return new MediaCodecHelper.VendorParameterCapabilityStore(decoderName -> {
++            openCount.incrementAndGet();
++            return session(Arrays.asList(
++                    LowLatencyProfilePlanner.QTI_PICTURE_ORDER,
++                    LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_ENABLE,
++                    LowLatencyProfilePlanner.QTI_OUTPUT_FENCE_TYPE), releaseCount);
++        });
++    }
++
++    private static MediaFormat videoFormat() {
++        return MediaFormat.createVideoFormat("video/avc", 1920, 1080);
++    }
++
++    private static Map<String, Integer> lowLatencyOptions(MediaFormat format) {
++        LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
++        for (String key : LOW_LATENCY_OPTION_KEYS) {
++            if (format.containsKey(key)) {
++                options.put(key, format.getInteger(key));
++            }
++        }
++        return options;
++    }
++
++    private static Set<String> optionKeys(MediaFormat format) {
++        Set<String> keys = new HashSet<>(format.getKeys());
++        keys.remove(MediaFormat.KEY_MIME);
++        keys.remove(MediaFormat.KEY_WIDTH);
++        keys.remove(MediaFormat.KEY_HEIGHT);
++        return keys;
++    }
++
++    private static Map<String, Integer> options(Object... keyValues) {
++        LinkedHashMap<String, Integer> options = new LinkedHashMap<>();
++        for (int i = 0; i < keyValues.length; i += 2) {
++            options.put((String) keyValues[i], (Integer) keyValues[i + 1]);
++        }
++        return options;
++    }
++
++    private static MediaCodecHelper.VendorParameterSession session(
++            List<String> parameters,
++            AtomicInteger releaseCount) {
++        return new MediaCodecHelper.VendorParameterSession() {
++            @Override
++            public List<String> getSupportedVendorParameters() {
++                return parameters;
++            }
++
++            @Override
++            public void release() {
++                releaseCount.incrementAndGet();
++            }
++        };
++    }
++}
